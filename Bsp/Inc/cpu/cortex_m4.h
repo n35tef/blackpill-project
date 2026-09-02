@@ -146,6 +146,11 @@ BSP_SIM_NOP_INTRINSIC(__WFE)
 static inline uint32_t __get_PRIMASK(void) { return 0U; }
 static inline void __set_PRIMASK(uint32_t priMask) { (void)priMask; }
 
+/* Delays are reported to the simulator instead of spun, so a driver that
+ * skips a required settling time is caught rather than merely running fast. */
+void bsp_sim_busy_wait(uint32_t cycles);
+static inline void __busy_wait(uint32_t cycles) { bsp_sim_busy_wait(cycles); }
+
 #else
 
 __attribute__((always_inline)) static inline void __enable_irq(void)
@@ -199,6 +204,22 @@ __attribute__((always_inline)) static inline void __WFI(void)
 __attribute__((always_inline)) static inline void __WFE(void)
 {
     __asm volatile("wfe");
+}
+
+/**
+ * @brief Spin for at least @p cycles core clocks.
+ *
+ * For the short analogue settling times the drivers need (ADC power-up, the
+ * temperature sensor start-up). Each loop iteration costs more than one cycle,
+ * so the wait is always at least as long as asked for. Not for user delays -
+ * use bsp_delay_us() for those.
+ */
+__attribute__((always_inline)) static inline void __busy_wait(uint32_t cycles)
+{
+    while (cycles-- != 0U)
+    {
+        __NOP();
+    }
 }
 
 #endif /* BSP_HOST_SIM */

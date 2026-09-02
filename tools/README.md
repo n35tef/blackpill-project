@@ -8,7 +8,9 @@ can be answered without a board on the desk.
 ./tools/verify.sh          # runs both
 ```
 
-Neither tool needs hardware, a debugger, or any ST software.
+Neither tool needs hardware, a debugger, or any ST software. `hostsim` needs
+x86-64 Linux, because its access monitor is built on page faults and the CPU
+trap flag.
 
 ## 1. `svdcheck` - is the register map right?
 
@@ -48,7 +50,7 @@ The same review established that ADC common `CDR` is a dual/triple-ADC result
 register with no function on the single-ADC F411, so the word is now marked as
 merely reserved.
 
-## 2. `hostsim` - do the drivers write the right bits?
+## 2. `hostsim` - do the drivers write the right bits, in the right order?
 
 Maps the STM32 peripheral region into a host process at its real addresses, so
 `RCC->CFGR = x` inside a driver writes into ordinary memory that the test can
@@ -62,13 +64,50 @@ write to the peripheral bus. Expected values are recalculated in the test from
 RM0383 with plain arithmetic rather than by reusing the driver's own macros,
 so a wrong formula cannot agree with itself.
 
-Current result: **86 checks covering RCC/PLL/flash latency, GPIO, SPI, USART,
-ADC, TIM, DMA and I2C**.
+### The access monitor
+
+Checking the final register state is not enough: a driver can leave every bit
+correct and still have written them in an order the hardware rejects. So the
+peripheral pages are mapped `PROT_NONE` and every load and store the drivers
+make is trapped (SIGSEGV to see the access, single-step to let it through, then
+re-protect). Each access is reported with its address, direction, old and new
+value to a set of rules taken from RM0383:
+
+- **Clock gating.** Any access to a peripheral whose `RCC->xxxENR` bit is clear
+  is a violation. On silicon that read returns garbage or bus-faults.
+- **RCC.** `PLLCFGR` written while `PLLON`; SYSCLK switched to a source whose
+  ready flag is clear; SYSCLK switched to a frequency the current `FLASH->ACR`
+  latency does not cover (table 6); HCLK above what the `PWR->CR` VOS scale
+  allows.
+- **SPI.** `CR1` reconfigured while `SPE=1`; `DR` written while `SPE=0`.
+- **USART.** `DR` written with `UE` or `TE` clear.
+- **DMA.** Any stream register reconfigured while `EN=1`.
+- **ADC.** `SWSTART` with `ADON=0`, or less than tSTAB after `ADON` was set.
+  The driver's settling delays go through `__busy_wait()`, which on the host
+  advances a cycle counter and on the target is a plain `NOP` loop.
+- **I2C.** A fake slave driven by the trace itself: START sets `SB`, the
+  address byte sets `ADDR` (or `AF` for an absent address), data flows on
+  `RXNE`/`TXE`/`BTF`. Touching `DR` or requesting STOP while `ADDR` has not been
+  cleared by the SR1-then-SR2 read sequence is a violation, as is writing
+  `CCR`/`TRISE`/`CR2` while `PE=1`.
+
+Every test group ends with one extra check that fails if any violation was
+recorded during it, printing which access broke which rule and which driver
+call was executing.
+
+Current result: **127 checks covering RCC/PLL/flash latency, GPIO, SPI, USART,
+ADC, TIM, DMA and I2C, with ~1000 traced register accesses and no sequencing
+violations**. The I2C driver completes real write, 1/2/N-byte read,
+register-read and ping (present and absent slave) transactions against the
+fake slave.
 
 ### Does it actually catch anything?
 
 A test suite that has never failed proves nothing, so the drivers were broken
-on purpose one change at a time. Eleven mutations, ten caught:
+on purpose one change at a time. The first eleven mutations targeted values;
+the next four targeted ordering and timing, chosen because they leave every
+register holding its correct final value and so are invisible to a state-only
+check.
 
 | Injected bug | Result |
 | --- | --- |
@@ -83,25 +122,32 @@ on purpose one change at a time. Eleven mutations, ten caught:
 | PLLQ written at the PLLN bit position | caught |
 | Flash latency one wait state too low | caught |
 | `bsp_spi_wait_idle()` stops waiting for TXE | **missed** |
+| Flash latency written *after* the SYSCLK switch | caught (monitor) |
+| ADC tSTAB delay removed | caught (monitor) |
+| I2C `SR2` read that clears `ADDR` removed | caught (monitor + transfer hangs) |
+| SPI `SPE` set before `CR1` is configured | caught (monitor) |
 
-The miss is the honest and expected one. The fake silicon holds TXE
-permanently set, so it cannot tell whether the driver waited for it. That is
-the shape of the tool's blind spot in general: it checks the *values* a driver
-writes, not the *order* it writes them in or how it reacts to a peripheral that
-is slow.
+Before the monitor existed the last four all passed, with identical output to
+an unmutated build. That is the gap it was written to close.
+
+The remaining miss is the fake silicon holding TXE permanently set for SPI, so
+it cannot tell whether the driver waited for it. The SPI model is still a
+status oracle, not a clocked shift register.
 
 ## What neither tool can tell you
 
 - **Analogue and electrical behaviour.** Crystal startup, drive strength, ADC
   accuracy, whether the I2C pull-ups are right.
-- **Real timing.** Setup and hold, the actual flash wait states at temperature,
-  whether a bus turnaround is fast enough.
-- **Protocol sequencing on the wire.** The I2C receive tails and SPI chip
-  select timing are the parts most likely to still be wrong, and they are
-  exactly what a RAM-backed model cannot judge. A logic analyser is the tool
-  for those.
+- **Real timing.** The monitor knows that a delay *happened*, not how long it
+  took in nanoseconds on the target at a given clock. Setup and hold, the
+  actual flash wait states at temperature, bus turnaround.
+- **The rules themselves.** They are my reading of RM0383. `svdcheck` has an
+  external oracle (ST's SVD); the sequencing rules do not. A rule that is wrong
+  in the same way as the driver passes.
+- **Anything the fake slave does not model.** Clock stretching, arbitration
+  loss, bus errors, a slave that NACKs mid-transfer.
 - **Interrupt behaviour.** Nothing here executes a vector table or exercises
   preemption.
 
-Configuration paths are well covered. Transfer paths are not. Treat anything
-that moves bytes over a wire as unproven until it has run on the board.
+Configuration and transfer *sequencing* are now covered. Treat wire-level
+behaviour as unproven until it has run on the board with a logic analyser.

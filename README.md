@@ -223,18 +223,22 @@ it and the drivers against the outside world, neither of which needs a board:
 - **`tools/svdcheck`** compares every base address, register offset and bit
   field against ST's published CMSIS-SVD description of the STM32F411 - an
   independent statement of the same facts, generated from the same database as
-  ST's own headers. 38 base addresses, 177 registers and 374 bit fields
+  ST's own headers. 38 base addresses, 177 registers and 375 bit fields
   currently agree.
 - **`tools/hostsim`** maps the peripheral region into a host process at its
   real addresses and runs the unmodified drivers against it, with a thread
-  playing the part of the silicon. 86 checks confirm the bits the drivers
-  actually write, with expected values recomputed from RM0383 rather than from
-  the driver's own macros.
+  playing the part of the silicon. Every register access is trapped and checked
+  against RM0383 sequencing rules (clock gating, flash latency before a clock
+  switch, no reconfiguring an enabled SPI/DMA, ADC settling time, the I2C
+  ADDR-clearing read sequence). 127 checks confirm both the bits the drivers
+  write and the order they write them in, with expected values recomputed from
+  RM0383 rather than from the driver's own macros.
 
 Both tools, what they cover, and - importantly - what they cannot tell you are
-documented in [tools/README.md](tools/README.md). The short version: the
-configuration paths are well covered, and anything that moves bytes over a wire
-is unproven until it has run on the board.
+documented in [tools/README.md](tools/README.md). The short version:
+configuration and register sequencing are covered, the rules are one reading of
+RM0383 with no external oracle, and wire-level timing is unproven until it has
+run on the board.
 
 ## Adding a peripheral
 

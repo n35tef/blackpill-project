@@ -95,11 +95,9 @@ void bsp_adc_init(void)
     ADC1->SQR1 = 0U;     /* sequence length of one                             */
     ADC1->CR2 = ADC_CR2_ADON;
 
-    /* The analog block needs a few microseconds to stabilise after ADON;
-     * converting before that returns garbage. */
-    for (volatile uint32_t i = 0U; i < 1000U; i++)
-    {
-    }
+    /* The analog block needs a few microseconds (tSTAB) to stabilise after
+     * ADON; converting before that returns garbage. */
+    __busy_wait(1000U);
 }
 
 void bsp_adc_config_pin(gpio_regs_t* port, uint32_t pin)
@@ -133,9 +131,7 @@ void bsp_adc_enable_internal_channels(void)
     ADC_COMMON->CCR |= ADC_CCR_TSVREFE;
 
     /* The sensor needs roughly 10 us to start up; this is comfortably over. */
-    for (volatile uint32_t i = 0U; i < 10000U; i++)
-    {
-    }
+    __busy_wait(10000U);
 }
 
 void bsp_adc_enable_vbat(void)
