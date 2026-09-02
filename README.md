@@ -213,6 +213,29 @@ _Static_assert(SPI2_BASE == 0x40003800UL, "SPI2 base address");
 These are `_Static_assert`s, so a wrong offset fails the compile. Nothing ships
 unverified.
 
+That only proves the map is self-consistent, though. Two further checks compare
+it and the drivers against the outside world, neither of which needs a board:
+
+```sh
+./tools/verify.sh
+```
+
+- **`tools/svdcheck`** compares every base address, register offset and bit
+  field against ST's published CMSIS-SVD description of the STM32F411 - an
+  independent statement of the same facts, generated from the same database as
+  ST's own headers. 38 base addresses, 177 registers and 374 bit fields
+  currently agree.
+- **`tools/hostsim`** maps the peripheral region into a host process at its
+  real addresses and runs the unmodified drivers against it, with a thread
+  playing the part of the silicon. 86 checks confirm the bits the drivers
+  actually write, with expected values recomputed from RM0383 rather than from
+  the driver's own macros.
+
+Both tools, what they cover, and - importantly - what they cannot tell you are
+documented in [tools/README.md](tools/README.md). The short version: the
+configuration paths are well covered, and anything that moves bytes over a wire
+is unproven until it has run on the board.
+
 ## Adding a peripheral
 
 1. Add the register block to `Bsp/Inc/device/regs/` and include it from
@@ -223,6 +246,8 @@ unverified.
    `#if BSP_USE_X`.
 4. Add `BSP_USE_X` to `bsp_config.h` and a call to `bsp_x_init()` in
    `bsp_init()`.
+5. Run `./tools/verify.sh` - the SVD check picks the new registers up on its
+   own, and adding a few assertions to `tools/hostsim/sim.c` covers the driver.
 
 The CMake build globs `Bsp/Src`, so there is no build file to edit. Re-run
 `cmake --preset Debug` to pick up the new file.

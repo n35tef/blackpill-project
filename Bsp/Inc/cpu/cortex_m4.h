@@ -125,6 +125,29 @@ typedef struct
 /* ------------------------------------------------------------------------ */
 /* Compiler intrinsics                                                      */
 /* ------------------------------------------------------------------------ */
+#ifdef BSP_HOST_SIM
+
+/* The host simulator (tools/hostsim) runs the real drivers on x86 against a
+ * mapped-in fake peripheral space, so the Cortex-M instructions have to become
+ * no-ops. Nothing else in the BSP changes, which is the point: the code under
+ * test is the code that ships. */
+#define BSP_SIM_NOP_INTRINSIC(name) \
+    __attribute__((always_inline)) static inline void name(void) {}
+
+BSP_SIM_NOP_INTRINSIC(__enable_irq)
+BSP_SIM_NOP_INTRINSIC(__disable_irq)
+BSP_SIM_NOP_INTRINSIC(__DSB)
+BSP_SIM_NOP_INTRINSIC(__ISB)
+BSP_SIM_NOP_INTRINSIC(__DMB)
+BSP_SIM_NOP_INTRINSIC(__NOP)
+BSP_SIM_NOP_INTRINSIC(__WFI)
+BSP_SIM_NOP_INTRINSIC(__WFE)
+
+static inline uint32_t __get_PRIMASK(void) { return 0U; }
+static inline void __set_PRIMASK(uint32_t priMask) { (void)priMask; }
+
+#else
+
 __attribute__((always_inline)) static inline void __enable_irq(void)
 {
     __asm volatile("cpsie i" ::: "memory");
@@ -177,6 +200,8 @@ __attribute__((always_inline)) static inline void __WFE(void)
 {
     __asm volatile("wfe");
 }
+
+#endif /* BSP_HOST_SIM */
 
 /* ------------------------------------------------------------------------ */
 /* NVIC helpers                                                             */

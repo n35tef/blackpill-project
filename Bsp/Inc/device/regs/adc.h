@@ -41,7 +41,7 @@ typedef struct
 {
     __I uint32_t CSR;  /**< 0x00 common status         */
     __IO uint32_t CCR; /**< 0x04 common control        */
-    __I uint32_t CDR;  /**< 0x08 common regular data   */
+    __I uint32_t CDR;  /**< 0x08 dual/triple mode data - unused on this part */
 } adc_common_regs_t;
 
 #define ADC1_BASE       (APB2PERIPH_BASE + 0x2000UL)

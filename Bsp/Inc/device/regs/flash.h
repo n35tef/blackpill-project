@@ -30,7 +30,15 @@ typedef struct
 
 /* ---- ACR ---------------------------------------------------------------- */
 #define FLASH_ACR_LATENCY_POS 0U
-#define FLASH_ACR_LATENCY_MSK (0xFUL << FLASH_ACR_LATENCY_POS)
+/*
+ * Three bits, not four. RM0383 prints the field as LATENCY[3:0], but ST's own
+ * F411 header and ST's F411 SVD both define it as 0x7 and stop at 7 wait
+ * states; the 16-state form belongs to the F42x/F43x/F446/F469 parts. It makes
+ * no practical difference - the F411 tops out at 100 MHz, which is 3 wait
+ * states - so the narrower mask is used to avoid writing a bit ST treats as
+ * reserved here.
+ */
+#define FLASH_ACR_LATENCY_MSK (0x7UL << FLASH_ACR_LATENCY_POS)
 #define FLASH_ACR_PRFTEN      (1UL << 8)  /**< prefetch enable      */
 #define FLASH_ACR_ICEN        (1UL << 9)  /**< instruction cache    */
 #define FLASH_ACR_DCEN        (1UL << 10) /**< data cache           */
