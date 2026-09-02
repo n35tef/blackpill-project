@@ -1,38 +1,80 @@
+/**
+ * @file    bsp.c
+ * @brief   Board bring-up sequencing.
+ */
+
 #include "bsp.h"
-#include "bsp_clock.h"
-#include "bsp_config.h"
-#include "bsp_gpio.h"
-#if BSP_USE_SPI2
-#include "bsp_spi2.h"
-#endif
 
-#include "stm32f4xx_hal.h"
-
-void bsp_init(void)
+bsp_status_t bsp_init(void)
 {
-    HAL_Init();
-    bsp_clock_init();
+    if (bsp_clock_init() != 0)
+    {
+        return BSP_ERR_CLOCK;
+    }
+
     bsp_gpio_init();
 
-#if BSP_USE_SPI2
-    bsp_spi2_init();
+#if BSP_USE_SYSTICK
+    if (bsp_systick_init() != 0)
+    {
+        return BSP_ERR_SYSTICK;
+    }
 #endif
+
+    /* From here on the order only matters in that DMA and SYSCFG must be up
+     * before the peripherals that hang off them. */
+#if BSP_USE_DMA1 || BSP_USE_DMA2
+    bsp_dma_init();
+#endif
+
+#if BSP_USE_EXTI
+    bsp_exti_init();
+#endif
+
+#if BSP_USE_SPI1 || BSP_USE_SPI2 || BSP_USE_SPI3 || BSP_USE_SPI4 || BSP_USE_SPI5
+    bsp_spi_init();
+#endif
+
+#if BSP_USE_USART1 || BSP_USE_USART2 || BSP_USE_USART6
+    bsp_usart_init();
+#endif
+
+#if BSP_USE_I2C1 || BSP_USE_I2C2 || BSP_USE_I2C3
+    bsp_i2c_init();
+#endif
+
+#if BSP_USE_TIM1 || BSP_USE_TIM2 || BSP_USE_TIM3 || BSP_USE_TIM4 || BSP_USE_TIM5 ||                \
+    BSP_USE_TIM9 || BSP_USE_TIM10 || BSP_USE_TIM11
+    bsp_tim_init();
+#endif
+
+#if BSP_USE_ADC1
+    bsp_adc_init();
+#endif
+
+#if BSP_USE_CRC
+    bsp_crc_init();
+#endif
+
+#if BSP_USE_RTC
+    if (bsp_rtc_init() != 0)
+    {
+        return BSP_ERR_PERIPHERAL;
+    }
+#endif
+
+    /* The watchdogs come last so nothing above can trip them mid bring-up. */
+#if BSP_USE_IWDG
+    bsp_iwdg_init();
+#endif
+
+    return BSP_OK;
 }
 
-void Error_Handler(void)
+__attribute__((weak)) void bsp_error_handler(void)
 {
     __disable_irq();
     while (1)
     {
     }
-}
-
-/**
- * @brief Global MSP init, called once by HAL_Init(). Peripheral-specific
- *        MSP callbacks (HAL_SPI_MspInit, etc.) live in their own bsp_xxx.c.
- */
-void HAL_MspInit(void)
-{
-    __HAL_RCC_SYSCFG_CLK_ENABLE();
-    __HAL_RCC_PWR_CLK_ENABLE();
 }

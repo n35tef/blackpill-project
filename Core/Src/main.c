@@ -1,35 +1,28 @@
 /**
- * @file main.c
- * @brief Minimal application entry point on top of the BSP.
+ * @file    main.c
+ * @brief   Application entry point.
  *
- * This is the only file most projects built on this base need to grow:
- * bsp_init() brings up HAL + the clock + whatever peripherals are enabled
- * in Bsp/Inc/bsp_config.h, then this loop is where your application code
- * goes.
+ * This is normally the only file you need to touch. bsp_init() brings up the
+ * clock tree and everything switched on in Bsp/Inc/bsp_config.h; the rest of
+ * this file is yours.
  */
-#include "main.h"
 
 #include "bsp.h"
-#include "bsp_config.h"
-#include "bsp_gpio.h"
 
 int main(void)
 {
-    bsp_init();
+    if (bsp_init() != BSP_OK)
+    {
+        bsp_error_handler();
+    }
 
     while (1)
     {
 #if BSP_USE_LED
         bsp_led_toggle();
 #endif
-        HAL_Delay(500);
+#if BSP_USE_SYSTICK
+        bsp_delay_ms(500);
+#endif
     }
 }
-
-#ifdef USE_FULL_ASSERT
-void assert_failed(uint8_t* file, uint32_t line)
-{
-    (void)file;
-    (void)line;
-}
-#endif /* USE_FULL_ASSERT */

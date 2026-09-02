@@ -1,65 +1,107 @@
+/**
+ * @file    bsp_gpio.c
+ * @brief   Register-level GPIO configuration.
+ */
+
 #include "bsp_gpio.h"
-#include "bsp_config.h"
 
-#include "stm32f4xx_hal.h"
+/** @brief Write a 2-bit field for @p pin into a MODER/OSPEEDR/PUPDR register. */
+static inline void write_2bit_field(volatile uint32_t* reg, uint32_t pin, uint32_t value)
+{
+    const uint32_t shift = pin * 2U;
+    *reg = (*reg & ~(0x3UL << shift)) | ((value & 0x3UL) << shift);
+}
 
-#if BSP_USE_LED
-#ifndef BSP_LED_PORT
-#define BSP_LED_PORT GPIOC
-#define BSP_LED_PIN  GPIO_PIN_13
-#endif
-#endif
+void bsp_gpio_enable_port(const gpio_regs_t* port)
+{
+    uint32_t bit = 0U;
 
-#if BSP_USE_BUTTON
-#ifndef BSP_BUTTON_PORT
-#define BSP_BUTTON_PORT GPIOA
-#define BSP_BUTTON_PIN  GPIO_PIN_0
-#endif
-#endif
+    if (port == GPIOA)
+    {
+        bit = RCC_AHB1ENR_GPIOAEN;
+    }
+    else if (port == GPIOB)
+    {
+        bit = RCC_AHB1ENR_GPIOBEN;
+    }
+    else if (port == GPIOC)
+    {
+        bit = RCC_AHB1ENR_GPIOCEN;
+    }
+    else if (port == GPIOD)
+    {
+        bit = RCC_AHB1ENR_GPIODEN;
+    }
+    else if (port == GPIOE)
+    {
+        bit = RCC_AHB1ENR_GPIOEEN;
+    }
+    else if (port == GPIOH)
+    {
+        bit = RCC_AHB1ENR_GPIOHEN;
+    }
+    else
+    {
+        return;
+    }
+
+    RCC->AHB1ENR |= bit;
+    /* Read back: the clock needs a cycle to reach the peripheral. */
+    (void)RCC->AHB1ENR;
+}
+
+void bsp_gpio_config_output(gpio_regs_t* port, uint32_t pin, uint32_t otype, uint32_t ospeed,
+                            uint32_t pupd)
+{
+    bsp_gpio_enable_port(port);
+
+    write_2bit_field(&port->OSPEEDR, pin, ospeed);
+    write_2bit_field(&port->PUPDR, pin, pupd);
+    port->OTYPER = (port->OTYPER & ~(1UL << pin)) | ((otype & 1UL) << pin);
+    write_2bit_field(&port->MODER, pin, GPIO_MODER_OUTPUT);
+}
+
+void bsp_gpio_config_input(gpio_regs_t* port, uint32_t pin, uint32_t pupd)
+{
+    bsp_gpio_enable_port(port);
+
+    write_2bit_field(&port->PUPDR, pin, pupd);
+    write_2bit_field(&port->MODER, pin, GPIO_MODER_INPUT);
+}
+
+void bsp_gpio_config_analog(gpio_regs_t* port, uint32_t pin)
+{
+    bsp_gpio_enable_port(port);
+
+    write_2bit_field(&port->PUPDR, pin, GPIO_PUPD_NONE);
+    write_2bit_field(&port->MODER, pin, GPIO_MODER_ANALOG);
+}
+
+void bsp_gpio_config_alternate(gpio_regs_t* port, uint32_t pin, uint32_t af, uint32_t otype,
+                               uint32_t ospeed, uint32_t pupd)
+{
+    bsp_gpio_enable_port(port);
+
+    /* AFR[0] covers pins 0-7, AFR[1] covers pins 8-15. */
+    const uint32_t index = pin >> 3U;
+    const uint32_t shift = (pin & 0x7U) * 4U;
+    port->AFR[index] = (port->AFR[index] & ~(0xFUL << shift)) | ((af & 0xFUL) << shift);
+
+    write_2bit_field(&port->OSPEEDR, pin, ospeed);
+    write_2bit_field(&port->PUPDR, pin, pupd);
+    port->OTYPER = (port->OTYPER & ~(1UL << pin)) | ((otype & 1UL) << pin);
+    write_2bit_field(&port->MODER, pin, GPIO_MODER_AF);
+}
 
 void bsp_gpio_init(void)
 {
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-    /* Cheap to always enable; HAL_GPIO_Init() elsewhere still needs the
-     * matching port clock on regardless of which peripheral uses it. */
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-    __HAL_RCC_GPIOC_CLK_ENABLE();
-
 #if BSP_USE_LED
-    HAL_GPIO_WritePin(BSP_LED_PORT, BSP_LED_PIN, GPIO_PIN_SET); /* off (active low) */
-    GPIO_InitStruct.Pin = BSP_LED_PIN;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(BSP_LED_PORT, &GPIO_InitStruct);
+    bsp_gpio_config_output(BSP_LED_PORT, BSP_LED_PIN, GPIO_OTYPER_PUSHPULL, GPIO_OSPEED_LOW,
+                           GPIO_PUPD_NONE);
+    bsp_led_off();
 #endif
 
 #if BSP_USE_BUTTON
-    GPIO_InitStruct.Pin = BSP_BUTTON_PIN;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(BSP_BUTTON_PORT, &GPIO_InitStruct);
+    bsp_gpio_config_input(BSP_BUTTON_PORT, BSP_BUTTON_PIN, BSP_BUTTON_PULL);
 #endif
 }
-
-#if BSP_USE_LED
-void bsp_led_write(int on)
-{
-    /* Onboard LED is active low. */
-    HAL_GPIO_WritePin(BSP_LED_PORT, BSP_LED_PIN, on ? GPIO_PIN_RESET : GPIO_PIN_SET);
-}
-
-void bsp_led_toggle(void)
-{
-    HAL_GPIO_TogglePin(BSP_LED_PORT, BSP_LED_PIN);
-}
-#endif
-
-#if BSP_USE_BUTTON
-int bsp_button_read(void)
-{
-    return HAL_GPIO_ReadPin(BSP_BUTTON_PORT, BSP_BUTTON_PIN) == GPIO_PIN_SET;
-}
-#endif
