@@ -19,9 +19,12 @@
 #include "bsp_exti.h"
 #include "bsp_i2c.h"
 #include "bsp_misc.h"
+#include "bsp_sdio.h"
 #include "bsp_spi.h"
 #include "bsp_tim.h"
 #include "bsp_usart.h"
+#include "bsp_usb.h"
+#include "bsp_usb_cdc.h"
 
 #include "device/stm32f411.h"
 

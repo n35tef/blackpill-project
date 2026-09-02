@@ -30,6 +30,10 @@ extern "C"
 #define AHB1PERIPH_BASE  (PERIPH_BASE + 0x00020000UL)
 #define AHB2PERIPH_BASE  0x50000000UL
 
+/* ---- System memory: factory-programmed device data (RM0383 24.1, 24.2) -- */
+#define UID_BASE       0x1FFF7A10UL /**< 96-bit unique device ID, 3 words    */
+#define FLASHSIZE_BASE 0x1FFF7A22UL /**< flash size in KB, 16 bits           */
+
 /* ---- Debug (private peripheral bus) ------------------------------------- */
 #define DBGMCU_BASE 0xE0042000UL
 

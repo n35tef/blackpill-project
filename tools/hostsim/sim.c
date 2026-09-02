@@ -122,8 +122,9 @@ typedef struct
 
 static region_t regions[] = {
     {0x40000000UL, 0x00030000UL, NULL}, /* APB1 / APB2 / AHB1 */
-    {0x50000000UL, 0x00010000UL, NULL}, /* AHB2               */
+    {0x50000000UL, 0x00040000UL, NULL}, /* AHB2 (OTG_FS FIFOs)*/
     {0xE0000000UL, 0x00100000UL, NULL}, /* Cortex-M private   */
+    {0x1FFF7000UL, 0x00001000UL, NULL}, /* system memory: UID */
 };
 #define REGION_COUNT (sizeof(regions) / sizeof(regions[0]))
 
@@ -341,6 +342,8 @@ static const periph_t periphs[] = {
     GATED(TIM10_BASE, 0x400, APB2ENR, RCC_APB2ENR_TIM10EN, "TIM10"),
     GATED(TIM11_BASE, 0x400, APB2ENR, RCC_APB2ENR_TIM11EN, "TIM11"),
     GATED(SPI5_BASE, 0x400, APB2ENR, RCC_APB2ENR_SPI5EN, "SPI5"),
+    GATED(SDIO_BASE, 0x400, APB2ENR, RCC_APB2ENR_SDIOEN, "SDIO"),
+    GATED(OTG_FS_BASE, 0x40000, AHB2ENR, RCC_AHB2ENR_OTGFSEN, "OTG_FS"),
     UNGATED(RCC_BASE, 0x400, "RCC"),
     UNGATED(FLASH_R_BASE, 0x400, "FLASH"),
     UNGATED(EXTI_BASE, 0x400, "EXTI"),
@@ -719,6 +722,1606 @@ static void sim_i2c(uintptr_t addr, i2c_regs_t* i2c, int write, uint32_t before,
     }
 }
 
+/* -- SD card constants (SD Physical Layer spec; private to bsp_sdio.c) ---- */
+
+#define SD_OCR_VOLTAGE_WINDOW 0x00FF8000UL
+#define SD_ACMD41_HCS         (1UL << 30)
+#define SD_OCR_CCS            (1UL << 30)
+#define SD_OCR_BUSY           (1UL << 31)
+#define SD_BUS_WIDTH_4        0x2UL
+#define SD_R1_OUT_OF_RANGE    (1UL << 31)
+#define SD_R1_ADDRESS_ERROR   (1UL << 30)
+#define SD_R1_BLOCK_LEN_ERROR (1UL << 29)
+#define SD_R1_ILLEGAL_COMMAND (1UL << 22)
+#define SD_R1_CURRENT_STATE_POS 9U
+#define SD_R1_READY_FOR_DATA  (1UL << 8)
+#define SD_R1_APP_CMD         (1UL << 5)
+
+/* CDC-ACM class requests (USB CDC PSTN 1.2, table 13; private to bsp_usb_cdc.c) */
+#define CDC_REQ_SET_LINE_CODING        0x20U
+#define CDC_REQ_GET_LINE_CODING        0x21U
+#define CDC_REQ_SET_CONTROL_LINE_STATE 0x22U
+
+/* -- SDIO: fake SD card plus RM0383 / SD-spec rules ------------------------ */
+
+/*
+ * The card model answers the command set bsp_sdio.c uses (CMD0/2/3/7/8/9/12/
+ * 13/16/17/18/24/25/55, ACMD6/41) and moves data through a 32-word FIFO the
+ * way the controller does: the card pushes or pulls up to 8 words each time
+ * the driver looks at STA, so a driver that services RXFIFOHF/TXFIFOHE too
+ * slowly sees RXOVERR rather than a conveniently infinite FIFO. It can be a
+ * v2 SDHC card (block addressing, CSD v2) or a v1 SDSC card (byte addressing,
+ * CSD v1, no answer to CMD8), so both identification paths run.
+ */
+
+#define SD_FAKE_BLOCKS 8U
+#define SD_FIFO_DEPTH  32U
+#define SD_MODEL_HC_CSIZE 15231U /* CSD v2 C_SIZE: (15231 + 1) * 1024 blocks, an 8 GB card */
+#define SD_MODEL_SC_READ_BL_LEN 10U /* 1024-byte native blocks                             */
+#define SD_MODEL_SC_CSIZE       1999U
+#define SD_MODEL_SC_CSIZE_MULT  7U   /* (1999 + 1) * 2^9 native blocks = 1 GB               */
+#define SD_MODEL_RCA 0x1234U
+
+typedef enum
+{
+    SD_S_IDLE = 0, SD_S_READY, SD_S_IDENT, SD_S_STBY, SD_S_TRAN, SD_S_DATA, SD_S_RCV, SD_S_PRG
+} sd_card_state_t;
+
+typedef enum
+{
+    SD_X_NONE, SD_X_READ, SD_X_WRITE_WAIT_DCTRL, SD_X_WRITE
+} sd_xfer_t;
+
+static struct
+{
+    bool high_capacity;   /* which card is inserted                          */
+    bool present;
+    sd_card_state_t state;
+    bool app_cmd;         /* CMD55 seen, next command is an ACMD             */
+    bool saw_cmd8;
+    unsigned acmd41_polls;
+    bool wide_bus;        /* ACMD6 accepted                                  */
+    unsigned busy_polls;  /* CMD13 answers "programming" this many more times */
+
+    uint64_t power_on_at, clock_on_at;
+    bool clock_was_on;
+
+    sd_xfer_t xfer;
+    bool multi_open;      /* CMD18/25 without CMD12 yet                      */
+    uint32_t block, byte_offset, total_words, moved_words;
+    uint32_t fifo[SD_FIFO_DEPTH];
+    unsigned fifo_head, fifo_level;
+
+    uint8_t storage[SD_FAKE_BLOCKS][512];
+    unsigned commands;    /* for the test to see the fake was exercised      */
+} sd;
+
+/** @brief Insert a card: SDHC v2 or SDSC v1. */
+static void sd_insert(bool high_capacity)
+{
+    memset(&sd, 0, sizeof(sd));
+    sd.present = true;
+    sd.high_capacity = high_capacity;
+    for (unsigned b = 0; b < SD_FAKE_BLOCKS; b++)
+    {
+        for (unsigned i = 0; i < 512; i++)
+        {
+            sd.storage[b][i] = (uint8_t)(0xA0U + b + i);
+        }
+    }
+}
+
+static uint32_t sd_clock_hz(void)
+{
+    const uint32_t clkcr = ALIAS(SDIO->CLKCR);
+    if (clkcr & SDIO_CLKCR_BYPASS)
+    {
+        return BSP_PLL_Q_OUT_HZ;
+    }
+    return BSP_PLL_Q_OUT_HZ / (FIELD(clkcr, SDIO_CLKCR_CLKDIV_MSK, SDIO_CLKCR_CLKDIV_POS) + 2U);
+}
+
+static uint32_t sd_r1(uint32_t extra)
+{
+    return ((uint32_t)sd.state << SD_R1_CURRENT_STATE_POS) |
+           ((sd.state == SD_S_TRAN) ? SD_R1_READY_FOR_DATA : 0U) | extra;
+}
+
+/** @brief Deliver a short or long response with the controller-side flags. */
+static void sd_respond(uint8_t index, bsp_sd_resp_t kind, const uint32_t* words)
+{
+    uint32_t sta = ALIAS(SDIO->STA) & ~(SDIO_STA_CMDACT);
+    switch (kind)
+    {
+        case SD_RESP_NONE:
+            sta |= SDIO_STA_CMDSENT;
+            break;
+        case SD_RESP_R3:
+            /* R3 has 0x7F where the CRC goes; the controller reports it as a
+             * CRC failure, and a driver that treats that as an error can
+             * never bring a card up. */
+            sta |= SDIO_STA_CCRCFAIL;
+            ALIAS(SDIO->RESPCMD) = 0x3FU;
+            ALIAS(SDIO->RESP1) = words[0];
+            break;
+        case SD_RESP_R2:
+            sta |= SDIO_STA_CMDREND;
+            ALIAS(SDIO->RESPCMD) = 0x3FU;
+            ALIAS(SDIO->RESP1) = words[0];
+            ALIAS(SDIO->RESP2) = words[1];
+            ALIAS(SDIO->RESP3) = words[2];
+            ALIAS(SDIO->RESP4) = words[3];
+            break;
+        default:
+            sta |= SDIO_STA_CMDREND;
+            ALIAS(SDIO->RESPCMD) = index;
+            ALIAS(SDIO->RESP1) = words[0];
+            break;
+    }
+    ALIAS(SDIO->STA) = sta;
+}
+
+/** @brief No card answers: CTIMEOUT, unless no response was expected (CMDSENT). */
+static void sd_timeout(void)
+{
+    const bool no_response =
+        FIELD(ALIAS(SDIO->CMD), SDIO_CMD_WAITRESP_MSK, SDIO_CMD_WAITRESP_POS) == SDIO_WAITRESP_NONE;
+    ALIAS(SDIO->STA) = (ALIAS(SDIO->STA) & ~SDIO_STA_CMDACT) |
+                       (no_response ? SDIO_STA_CMDSENT : SDIO_STA_CTIMEOUT);
+}
+
+static void sd_fifo_reset(void)
+{
+    sd.fifo_head = 0;
+    sd.fifo_level = 0;
+}
+
+static void sd_fifo_push(uint32_t word)
+{
+    sd.fifo[(sd.fifo_head + sd.fifo_level) % SD_FIFO_DEPTH] = word;
+    sd.fifo_level++;
+    if (sd.fifo_level == 1U)
+    {
+        ALIAS(SDIO->FIFO) = word; /* the next read sees the head word */
+    }
+}
+
+static uint32_t sd_fifo_pop(void)
+{
+    const uint32_t word = sd.fifo[sd.fifo_head];
+    sd.fifo_head = (sd.fifo_head + 1U) % SD_FIFO_DEPTH;
+    sd.fifo_level--;
+    ALIAS(SDIO->FIFO) = sd.fifo_level ? sd.fifo[sd.fifo_head] : 0xDEADBEEFU;
+    return word;
+}
+
+/** @brief Word @p n of the current transfer, from the card's storage. */
+static uint32_t sd_storage_word(uint32_t n)
+{
+    const uint32_t byte = sd.byte_offset + 4U * n;
+    const uint32_t block = sd.block + byte / 512U;
+    if (block >= SD_FAKE_BLOCKS)
+    {
+        return 0U;
+    }
+    uint32_t w;
+    memcpy(&w, &sd.storage[block][byte % 512U], 4U);
+    return w;
+}
+
+static void sd_storage_store(uint32_t n, uint32_t w)
+{
+    const uint32_t byte = sd.byte_offset + 4U * n;
+    const uint32_t block = sd.block + byte / 512U;
+    if (block < SD_FAKE_BLOCKS)
+    {
+        memcpy(&sd.storage[block][byte % 512U], &w, 4U);
+    }
+}
+
+/** @brief Refresh the FIFO level flags in STA from the model. */
+static void sd_update_fifo_flags(void)
+{
+    uint32_t sta = ALIAS(SDIO->STA) &
+                   ~(SDIO_STA_RXDAVL | SDIO_STA_RXFIFOHF | SDIO_STA_RXFIFOF | SDIO_STA_RXFIFOE |
+                     SDIO_STA_TXDAVL | SDIO_STA_TXFIFOHE | SDIO_STA_TXFIFOF | SDIO_STA_TXFIFOE |
+                     SDIO_STA_RXACT | SDIO_STA_TXACT);
+    if (sd.xfer == SD_X_READ || (sd.xfer == SD_X_NONE && sd.fifo_level))
+    {
+        sta |= sd.fifo_level ? SDIO_STA_RXDAVL : SDIO_STA_RXFIFOE;
+        sta |= (sd.fifo_level >= 8U) ? SDIO_STA_RXFIFOHF : 0U;
+        sta |= (sd.fifo_level >= SD_FIFO_DEPTH) ? SDIO_STA_RXFIFOF : 0U;
+        sta |= (sd.xfer == SD_X_READ) ? SDIO_STA_RXACT : 0U;
+    }
+    else if (sd.xfer == SD_X_WRITE)
+    {
+        sta |= sd.fifo_level ? SDIO_STA_TXDAVL : SDIO_STA_TXFIFOE;
+        sta |= (sd.fifo_level <= SD_FIFO_DEPTH - 8U) ? SDIO_STA_TXFIFOHE : 0U;
+        sta |= (sd.fifo_level >= SD_FIFO_DEPTH) ? SDIO_STA_TXFIFOF : 0U;
+        sta |= SDIO_STA_TXACT;
+    }
+    else
+    {
+        sta |= SDIO_STA_TXFIFOE | SDIO_STA_TXFIFOHE | SDIO_STA_RXFIFOE;
+    }
+    ALIAS(SDIO->STA) = sta;
+}
+
+/** @brief The card moves up to 8 words per look at STA. */
+static void sd_advance(uintptr_t addr)
+{
+    if (sd.xfer == SD_X_READ)
+    {
+        unsigned n = 0;
+        while (n < 8U && sd.moved_words < sd.total_words)
+        {
+            if (sd.fifo_level >= SD_FIFO_DEPTH)
+            {
+                violation(addr, "SDIO receive FIFO overrun: 32 words unread while the card kept sending");
+                ALIAS(SDIO->STA) |= SDIO_STA_RXOVERR;
+                sd.xfer = SD_X_NONE;
+                return;
+            }
+            sd_fifo_push(sd_storage_word(sd.moved_words));
+            sd.moved_words++;
+            n++;
+        }
+        if (sd.moved_words == sd.total_words)
+        {
+            ALIAS(SDIO->STA) |= SDIO_STA_DATAEND | SDIO_STA_DBCKEND;
+            sd.xfer = SD_X_NONE; /* the FIFO still holds the tail; RXDAVL says so */
+            sd.state = sd.multi_open ? SD_S_DATA : SD_S_TRAN;
+        }
+    }
+    else if (sd.xfer == SD_X_WRITE)
+    {
+        unsigned n = 0;
+        while (n < 8U && sd.fifo_level > 0U)
+        {
+            sd_storage_store(sd.moved_words, sd_fifo_pop());
+            sd.moved_words++;
+            n++;
+        }
+        if (sd.moved_words == sd.total_words)
+        {
+            ALIAS(SDIO->STA) |= SDIO_STA_DATAEND | SDIO_STA_DBCKEND;
+            sd.xfer = SD_X_NONE;
+            sd.state = sd.multi_open ? SD_S_RCV : SD_S_PRG;
+            sd.busy_polls = 2; /* programming: CMD13 says so twice */
+        }
+    }
+    sd_update_fifo_flags();
+}
+
+static void sd_build_csd(uint32_t csd[4])
+{
+    memset(csd, 0, 16);
+    if (sd.high_capacity)
+    {
+        /* CSD v2: CSD_STRUCTURE = 1 at [127:126]; C_SIZE at [69:48]. */
+        csd[0] = 1UL << 30;
+        csd[1] |= (SD_MODEL_HC_CSIZE >> 16) & 0x3FU;     /* bits 69:64 */
+        csd[2] |= (SD_MODEL_HC_CSIZE & 0xFFFFU) << 16;   /* bits 63:48 */
+    }
+    else
+    {
+        /* CSD v1: READ_BL_LEN [83:80], C_SIZE [73:62], C_SIZE_MULT [49:47]. */
+        csd[1] |= SD_MODEL_SC_READ_BL_LEN << 16;         /* bits 83:80 */
+        csd[1] |= (SD_MODEL_SC_CSIZE >> 2) & 0x3FFU;     /* bits 73:64 */
+        csd[2] |= (SD_MODEL_SC_CSIZE & 0x3U) << 30;      /* bits 63:62 */
+        csd[2] |= SD_MODEL_SC_CSIZE_MULT << 15;          /* bits 49:47 */
+    }
+}
+
+/** @brief Block count the model's CSD encodes, derived by SD-spec arithmetic. */
+static uint32_t sd_model_block_count(bool high_capacity)
+{
+    if (high_capacity)
+    {
+        return (SD_MODEL_HC_CSIZE + 1U) * 1024U;
+    }
+    const uint64_t bytes = (uint64_t)(SD_MODEL_SC_CSIZE + 1U) *
+                           (1ULL << (SD_MODEL_SC_CSIZE_MULT + 2U)) *
+                           (1ULL << SD_MODEL_SC_READ_BL_LEN);
+    return (uint32_t)(bytes / 512U);
+}
+
+/** @brief Address argument -> block number, checking the addressing mode. */
+static uint32_t sd_block_of(uintptr_t addr, uint32_t arg)
+{
+    if (sd.high_capacity)
+    {
+        return arg;
+    }
+    if (arg % 512U)
+    {
+        violation(addr, "SDSC card given byte address 0x%08X that is not block aligned", arg);
+    }
+    return arg / 512U;
+}
+
+static void sd_command(uintptr_t addr, uint32_t cmd)
+{
+    const uint8_t index = (uint8_t)FIELD(cmd, SDIO_CMD_CMDINDEX_MSK, SDIO_CMD_CMDINDEX_POS);
+    const uint32_t arg = ALIAS(SDIO->ARG);
+    const uint32_t clkcr = ALIAS(SDIO->CLKCR);
+    const bool acmd = sd.app_cmd;
+    uint32_t r[4] = {0, 0, 0, 0};
+    sd.app_cmd = false;
+    sd.commands++;
+
+    /* Controller-side preconditions. */
+    if (FIELD(ALIAS(SDIO->POWER), SDIO_POWER_PWRCTRL_MSK, SDIO_POWER_PWRCTRL_POS) != SDIO_PWRCTRL_ON)
+    {
+        violation(addr, "command sent with SDIO POWER off");
+    }
+    if (!(clkcr & SDIO_CLKCR_CLKEN))
+    {
+        violation(addr, "command sent with CLKCR.CLKEN=0: no SDIO_CK, nothing leaves the pin");
+    }
+    if (ALIAS(SDIO->STA) & SDIO_STA_CMDACT)
+    {
+        violation(addr, "command sent while the previous one is still active");
+    }
+    if (!sd.present)
+    {
+        sd_timeout();
+        return;
+    }
+
+    /* Identification runs at <= 400 kHz until the card has an address. */
+    const bool ident_cmd = (index == 0U) || (index == 8U) || (index == 55U) || (index == 2U) ||
+                           (index == 3U) || (acmd && index == 41U);
+    if (ident_cmd && sd.state <= SD_S_IDENT && sd_clock_hz() > 400000U)
+    {
+        violation(addr, "CMD%u during identification at %u Hz; SD spec caps it at 400 kHz", index,
+                  sd_clock_hz());
+    }
+    if (index == 0U && sd.commands == 1U)
+    {
+        /* SD spec 6.4.1: 1 ms after power then 74 clocks before the first command. */
+        const uint64_t ck = sd_clock_hz();
+        const uint64_t needed = 74ULL * BSP_HCLK_HZ / (ck ? ck : 1U);
+        if (sim_cycles - sd.clock_on_at < needed)
+        {
+            violation(addr, "CMD0 %llu cycles after CLKEN; the card needs 74 SDIO_CK = %llu cycles",
+                      (unsigned long long)(sim_cycles - sd.clock_on_at), (unsigned long long)needed);
+        }
+    }
+
+    if (acmd)
+    {
+        switch (index)
+        {
+            case 41U: /* SD_SEND_OP_COND: R3 OCR */
+                if ((arg & SD_ACMD41_HCS) && !sd.saw_cmd8)
+                {
+                    violation(addr, "ACMD41 with HCS set but no successful CMD8 first (SD spec 4.2.3)");
+                }
+                sd.acmd41_polls++;
+                r[0] = SD_OCR_VOLTAGE_WINDOW;
+                if (sd.acmd41_polls >= 3U) /* takes a couple of polls, like real cards */
+                {
+                    r[0] |= SD_OCR_BUSY | (sd.high_capacity ? SD_OCR_CCS : 0U);
+                    sd.state = SD_S_READY;
+                }
+                sd_respond(index, SD_RESP_R3, r);
+                return;
+            case 6U: /* SET_BUS_WIDTH */
+                if (sd.state != SD_S_TRAN)
+                {
+                    violation(addr, "ACMD6 outside transfer state");
+                    r[0] = sd_r1(SD_R1_ILLEGAL_COMMAND);
+                }
+                else if (FIELD(clkcr, SDIO_CLKCR_WIDBUS_MSK, SDIO_CLKCR_WIDBUS_POS) != SDIO_WIDBUS_1BIT)
+                {
+                    violation(addr, "ACMD6 sent after WIDBUS was already widened: the card still answers on one line");
+                    r[0] = sd_r1(0);
+                }
+                else
+                {
+                    sd.wide_bus = (arg == SD_BUS_WIDTH_4);
+                    r[0] = sd_r1(0);
+                }
+                sd_respond(index, SD_RESP_R1, r);
+                return;
+            default:
+                break; /* fall through to the plain command set */
+        }
+    }
+
+    switch (index)
+    {
+        case 0U: /* GO_IDLE_STATE */
+            sd.state = SD_S_IDLE;
+            sd.saw_cmd8 = false;
+            sd.acmd41_polls = 0;
+            sd.wide_bus = false;
+            sd_respond(index, SD_RESP_NONE, r);
+            return;
+
+        case 8U: /* SEND_IF_COND: v2 only */
+            if (!sd.high_capacity)
+            {
+                sd_timeout(); /* a v1 card does not know CMD8 */
+                return;
+            }
+            if (sd.state != SD_S_IDLE)
+            {
+                violation(addr, "CMD8 outside idle state");
+            }
+            sd.saw_cmd8 = true;
+            r[0] = arg & 0xFFFU; /* echo the voltage window and check pattern */
+            sd_respond(index, SD_RESP_R7, r);
+            return;
+
+        case 55U: /* APP_CMD */
+            sd.app_cmd = true;
+            r[0] = sd_r1(SD_R1_APP_CMD);
+            sd_respond(index, SD_RESP_R1, r);
+            return;
+
+        case 2U: /* ALL_SEND_CID */
+            if (sd.state != SD_S_READY)
+            {
+                violation(addr, "CMD2 before ACMD41 reported power-up done");
+            }
+            r[0] = 0x03534453U; /* MID 0x03, OID "SD" */
+            r[1] = 0x53554E4BU;
+            r[2] = 0x80123456U;
+            r[3] = 0x00001234U;
+            sd.state = SD_S_IDENT;
+            sd_respond(index, SD_RESP_R2, r);
+            return;
+
+        case 3U: /* SEND_RELATIVE_ADDR: R6 */
+            if (sd.state != SD_S_IDENT)
+            {
+                violation(addr, "CMD3 before CMD2");
+            }
+            sd.state = SD_S_STBY;
+            r[0] = ((uint32_t)SD_MODEL_RCA << 16) | ((uint32_t)sd.state << 9) | (1UL << 8);
+            sd_respond(index, SD_RESP_R6, r);
+            return;
+
+        case 9U: /* SEND_CSD: standby only */
+            if ((arg >> 16) != SD_MODEL_RCA)
+            {
+                sd_timeout(); /* not addressed to us */
+                return;
+            }
+            if (sd.state != SD_S_STBY)
+            {
+                violation(addr, "CMD9 sent to a selected card (SD spec: SEND_CSD is a stand-by command)");
+            }
+            sd_build_csd(r);
+            sd_respond(index, SD_RESP_R2, r);
+            return;
+
+        case 7U: /* SELECT/DESELECT */
+            if ((arg >> 16) == SD_MODEL_RCA)
+            {
+                if (sd.state != SD_S_STBY)
+                {
+                    violation(addr, "CMD7 select outside stand-by");
+                }
+                r[0] = sd_r1(0); /* status is the state before the command */
+                sd.state = SD_S_TRAN;
+                sd_respond(index, SD_RESP_R1B, r);
+            }
+            else
+            {
+                sd.state = SD_S_STBY;
+                sd_timeout(); /* deselect has no response */
+            }
+            return;
+
+        case 13U: /* SEND_STATUS */
+            if (sd.state == SD_S_PRG && sd.busy_polls > 0U)
+            {
+                sd.busy_polls--;
+                r[0] = sd_r1(0); /* programming, not ready */
+                if (sd.busy_polls == 0U)
+                {
+                    sd.state = SD_S_TRAN;
+                }
+            }
+            else
+            {
+                r[0] = sd_r1(0);
+            }
+            sd_respond(index, SD_RESP_R1, r);
+            return;
+
+        case 16U: /* SET_BLOCKLEN */
+            if (sd.state != SD_S_TRAN)
+            {
+                violation(addr, "CMD16 outside transfer state");
+                r[0] = sd_r1(SD_R1_ILLEGAL_COMMAND);
+            }
+            else if (arg != 512U && !sd.high_capacity)
+            {
+                r[0] = sd_r1(SD_R1_BLOCK_LEN_ERROR);
+            }
+            else
+            {
+                r[0] = sd_r1(0);
+            }
+            sd_respond(index, SD_RESP_R1, r);
+            return;
+
+        case 17U: case 18U: /* READ_SINGLE / READ_MULTIPLE */
+        case 24U: case 25U: /* WRITE_BLOCK / WRITE_MULTIPLE */
+        {
+            const bool read = (index == 17U) || (index == 18U);
+            const bool multi = (index == 18U) || (index == 25U);
+            const uint32_t dctrl = ALIAS(SDIO->DCTRL);
+            const uint32_t dlen = ALIAS(SDIO->DLEN);
+
+            if (sd.state != SD_S_TRAN)
+            {
+                violation(addr, "CMD%u while the card is in state %u, not transfer (4)", index, sd.state);
+                r[0] = sd_r1(SD_R1_ILLEGAL_COMMAND);
+                sd_respond(index, SD_RESP_R1, r);
+                return;
+            }
+            if (sd.multi_open)
+            {
+                violation(addr, "CMD%u while a multiple-block transfer is still open (no CMD12)", index);
+            }
+            if (!sd.high_capacity && (arg % 512U))
+            {
+                r[0] = sd_r1(SD_R1_ADDRESS_ERROR);
+                sd_respond(index, SD_RESP_R1, r);
+                return;
+            }
+            sd.block = sd_block_of(addr, arg);
+            if (sd.block >= sd_model_block_count(sd.high_capacity))
+            {
+                r[0] = sd_r1(SD_R1_OUT_OF_RANGE);
+                sd_respond(index, SD_RESP_R1, r);
+                return;
+            }
+
+            /* RM0383 21.3.2 / 21.4: DPSM before the read command, after the
+             * write command. */
+            if (read)
+            {
+                if (!(dctrl & SDIO_DCTRL_DTEN) || !(dctrl & SDIO_DCTRL_DTDIR))
+                {
+                    violation(addr, "read CMD%u sent before DCTRL was armed with DTEN|DTDIR: the first block is lost", index);
+                }
+                if (FIELD(dctrl, SDIO_DCTRL_DBLOCKSIZE_MSK, SDIO_DCTRL_DBLOCKSIZE_POS) != 9U)
+                {
+                    violation(addr, "DBLOCKSIZE=%u, blocks are 2^9 bytes",
+                              (unsigned)FIELD(dctrl, SDIO_DCTRL_DBLOCKSIZE_MSK, SDIO_DCTRL_DBLOCKSIZE_POS));
+                }
+                if (dlen == 0U || (dlen % 512U))
+                {
+                    violation(addr, "DLEN=%u is not a whole number of blocks", dlen);
+                }
+                if (ALIAS(SDIO->DTIMER) == 0U)
+                {
+                    violation(addr, "DTIMER=0: the data path would time out immediately");
+                }
+                sd.xfer = SD_X_READ;
+                sd.state = SD_S_DATA;
+            }
+            else
+            {
+                if (dctrl & SDIO_DCTRL_DTEN)
+                {
+                    violation(addr, "write CMD%u sent with DCTRL.DTEN already set (RM0383 21.3.2: command first, then DCTRL)", index);
+                }
+                sd.xfer = SD_X_WRITE_WAIT_DCTRL;
+                sd.state = SD_S_RCV;
+            }
+            sd.multi_open = multi;
+            sd.byte_offset = 0;
+            sd.total_words = dlen / 4U;
+            sd.moved_words = 0;
+            sd_fifo_reset();
+            r[0] = ((uint32_t)SD_S_TRAN << SD_R1_CURRENT_STATE_POS) | SD_R1_READY_FOR_DATA;
+            sd_respond(index, SD_RESP_R1, r);
+            sd_update_fifo_flags();
+            return;
+        }
+
+        case 12U: /* STOP_TRANSMISSION */
+            if (!sd.multi_open)
+            {
+                violation(addr, "CMD12 with no multiple-block transfer open");
+            }
+            r[0] = sd_r1(0);
+            sd.multi_open = false;
+            sd.xfer = SD_X_NONE;
+            if (sd.state == SD_S_RCV)
+            {
+                sd.state = SD_S_PRG;
+                sd.busy_polls = 2;
+            }
+            else
+            {
+                sd.state = SD_S_TRAN;
+            }
+            sd_respond(index, SD_RESP_R1B, r);
+            return;
+
+        default:
+            violation(addr, "CMD%u is not something this card model knows", index);
+            r[0] = sd_r1(SD_R1_ILLEGAL_COMMAND);
+            sd_respond(index, SD_RESP_R1, r);
+            return;
+    }
+}
+
+static void sim_sdio(uintptr_t addr, int write, uint32_t before, uint32_t after)
+{
+    if (!write)
+    {
+        if (addr == (uintptr_t)&SDIO->STA)
+        {
+            sd_advance(addr);
+        }
+        else if (addr == (uintptr_t)&SDIO->FIFO)
+        {
+            if (sd.fifo_level == 0U)
+            {
+                violation(addr, "SDIO FIFO read while empty (RXDAVL=0)");
+            }
+            else
+            {
+                (void)sd_fifo_pop();
+                sd_update_fifo_flags();
+            }
+        }
+        return;
+    }
+
+    if (addr == (uintptr_t)&SDIO->POWER)
+    {
+        if (FIELD(after, SDIO_POWER_PWRCTRL_MSK, SDIO_POWER_PWRCTRL_POS) == SDIO_PWRCTRL_ON &&
+            FIELD(before, SDIO_POWER_PWRCTRL_MSK, SDIO_POWER_PWRCTRL_POS) != SDIO_PWRCTRL_ON)
+        {
+            sd.power_on_at = sim_cycles;
+            sd.clock_was_on = false;
+        }
+    }
+    else if (addr == (uintptr_t)&SDIO->CLKCR)
+    {
+        if (sd.xfer != SD_X_NONE)
+        {
+            violation(addr, "CLKCR changed during a data transfer");
+        }
+        if ((after & SDIO_CLKCR_CLKEN) && !sd.clock_was_on)
+        {
+            sd.clock_was_on = true;
+            sd.clock_on_at = sim_cycles;
+            /* SD spec 6.4.1.1: VDD must be stable for 1 ms before the clock. */
+            if (sim_cycles - sd.power_on_at < BSP_HCLK_HZ / 1000U)
+            {
+                violation(addr, "CLKEN %llu cycles after power on; the card needs 1 ms = %u cycles",
+                          (unsigned long long)(sim_cycles - sd.power_on_at), (unsigned)(BSP_HCLK_HZ / 1000U));
+            }
+        }
+        const uint32_t widbus = FIELD(after, SDIO_CLKCR_WIDBUS_MSK, SDIO_CLKCR_WIDBUS_POS);
+        if (widbus == SDIO_WIDBUS_4BIT && !sd.wide_bus)
+        {
+            violation(addr, "WIDBUS set to 4-bit before the card accepted ACMD6");
+        }
+        if (widbus == SDIO_WIDBUS_8BIT)
+        {
+            violation(addr, "WIDBUS 8-bit: SD cards have four data lines");
+        }
+        if (sd_clock_hz() > 25000000U && sd.state >= SD_S_STBY)
+        {
+            violation(addr, "SDIO_CK %u Hz exceeds 25 MHz default-speed mode", sd_clock_hz());
+        }
+        if (sd_clock_hz() > BSP_HCLK_HZ / 2U)
+        {
+            violation(addr, "SDIO_CK %u Hz exceeds HCLK/2 (RM0383 21.3)", sd_clock_hz());
+        }
+    }
+    else if (addr == (uintptr_t)&SDIO->CMD)
+    {
+        if (after & SDIO_CMD_CPSMEN)
+        {
+            sd_command(addr, after);
+        }
+    }
+    else if (addr == (uintptr_t)&SDIO->ICR)
+    {
+        /* Write-one-to-clear; only the static flags survive. */
+        ALIAS(SDIO->STA) &= ~(after & SDIO_ICR_ALL_FLAGS);
+        ALIAS(SDIO->ICR) = 0;
+    }
+    else if (addr == (uintptr_t)&SDIO->DCTRL)
+    {
+        if (after & SDIO_DCTRL_DTEN)
+        {
+            if (!(after & SDIO_DCTRL_DTDIR))
+            {
+                if (sd.xfer != SD_X_WRITE_WAIT_DCTRL)
+                {
+                    violation(addr, "DCTRL armed for a write with no write command pending");
+                }
+                else
+                {
+                    sd.xfer = SD_X_WRITE;
+                    sd.total_words = ALIAS(SDIO->DLEN) / 4U;
+                    sd.moved_words = 0;
+                    sd_fifo_reset();
+                }
+            }
+            if (ALIAS(SDIO->DLEN) % 512U)
+            {
+                violation(addr, "DTEN with DLEN not a multiple of the block size");
+            }
+            sd_update_fifo_flags();
+        }
+        else if (before & SDIO_DCTRL_DTEN)
+        {
+            sd.xfer = SD_X_NONE; /* aborted */
+            sd_fifo_reset();
+            sd_update_fifo_flags();
+        }
+    }
+    else if (addr == (uintptr_t)&SDIO->DLEN)
+    {
+        if (ALIAS(SDIO->DCTRL) & SDIO_DCTRL_DTEN)
+        {
+            violation(addr, "DLEN written while DTEN=1");
+        }
+    }
+    else if (addr == (uintptr_t)&SDIO->FIFO)
+    {
+        if (sd.xfer != SD_X_WRITE)
+        {
+            violation(addr, "SDIO FIFO written with no write transfer armed");
+        }
+        else if (sd.fifo_level >= SD_FIFO_DEPTH)
+        {
+            violation(addr, "SDIO transmit FIFO written while full");
+        }
+        else
+        {
+            sd_fifo_push(after);
+            sd_update_fifo_flags();
+        }
+    }
+}
+
+/* -- OTG_FS: fake USB host plus RM0383 22.17 rules ------------------------- */
+
+/*
+ * The device core is interrupt driven, so the model plays the NVIC as well
+ * as the host: every bus event lands in GINTSTS and OTG_FS_IRQHandler() is
+ * called until nothing unmasked is pending, exactly as a level-sensitive
+ * interrupt line would behave. Packets travel through a model of the shared
+ * receive FIFO (status entries popped via GRXSTSP, data words behind them)
+ * and per-endpoint transmit FIFOs whose contents the host collects on IN.
+ */
+
+void OTG_FS_IRQHandler(void); /* the vector the NVIC would call; bsp_usb.c */
+
+#define USB_RX_QUEUE 16
+#define USB_FIFO_PAGE 0x1000UL
+
+typedef struct
+{
+    uint32_t status;
+    uint32_t words[16];
+    unsigned nwords;
+} usb_rx_entry_t;
+
+static struct
+{
+    /* receive FIFO model */
+    usb_rx_entry_t queue[USB_RX_QUEUE];
+    unsigned head, count;
+    usb_rx_entry_t current; /* popped status; its words are read next     */
+    unsigned current_read;
+
+    /* transmit FIFO model, per IN endpoint */
+    struct
+    {
+        uint8_t bytes[1024];
+        unsigned nbytes;
+        uint32_t xfrsiz, pktcnt;
+        bool armed;
+        uint64_t armed_at;
+    } tx[OTG_FS_EP_COUNT];
+
+    uint64_t fdmod_at;
+    bool fdmod_seen;
+    bool connected;   /* SDIS cleared                                  */
+    unsigned irqs;
+    unsigned in_tokens, out_tokens;
+} usb;
+
+static inline uint32_t* usb_alias(uintptr_t a)
+{
+    return (uint32_t*)alias_of((const volatile void*)a);
+}
+
+static uint32_t usb_tx_depth_words(unsigned ep)
+{
+    if (ep == 0U)
+    {
+        return FIELD(ALIAS(OTG_FS_GLOBAL->DIEPTXF0), OTG_DIEPTXF0_TX0FD_MSK, OTG_DIEPTXF0_TX0FD_POS);
+    }
+    const uint32_t reg = (ep == 1U) ? ALIAS(OTG_FS_GLOBAL->DIEPTXF1)
+                       : (ep == 2U) ? ALIAS(OTG_FS_GLOBAL->DIEPTXF2)
+                                    : ALIAS(OTG_FS_GLOBAL->DIEPTXF3);
+    return FIELD(reg, OTG_DIEPTXF_INEPTXFD_MSK, OTG_DIEPTXF_INEPTXFD_POS);
+}
+
+static void usb_refresh_ep_summary(void)
+{
+    uint32_t daint = 0;
+    for (unsigned ep = 0; ep < OTG_FS_EP_COUNT; ep++)
+    {
+        if (ALIAS(OTG_FS_DEVICE->INEP[ep].DIEPINT) & ~OTG_DIEPINT_TXFE)
+        {
+            daint |= 1UL << (OTG_DAINT_IEPINT_POS + ep);
+        }
+        if (ALIAS(OTG_FS_DEVICE->OUTEP[ep].DOEPINT))
+        {
+            daint |= 1UL << (OTG_DAINT_OEPINT_POS + ep);
+        }
+    }
+    ALIAS(OTG_FS_DEVICE->DAINT) = daint;
+    uint32_t gint = ALIAS(OTG_FS_GLOBAL->GINTSTS) & ~(OTG_GINTSTS_IEPINT | OTG_GINTSTS_OEPINT);
+    if (daint & OTG_DAINT_IEPINT_MSK) { gint |= OTG_GINTSTS_IEPINT; }
+    if (daint & OTG_DAINT_OEPINT_MSK) { gint |= OTG_GINTSTS_OEPINT; }
+    ALIAS(OTG_FS_GLOBAL->GINTSTS) = gint;
+}
+
+static void usb_raise_in(unsigned ep, uint32_t flags)
+{
+    ALIAS(OTG_FS_DEVICE->INEP[ep].DIEPINT) |= flags;
+    usb_refresh_ep_summary();
+}
+
+static void usb_raise_out(unsigned ep, uint32_t flags)
+{
+    ALIAS(OTG_FS_DEVICE->OUTEP[ep].DOEPINT) |= flags;
+    usb_refresh_ep_summary();
+}
+
+/** @brief Put the head of the receive queue where GRXSTSP/GRXSTSR and the FIFO show it. */
+static void usb_rx_expose(void)
+{
+    if (usb.count == 0U)
+    {
+        ALIAS(OTG_FS_GLOBAL->GINTSTS) &= ~OTG_GINTSTS_RXFLVL;
+        ALIAS(OTG_FS_GLOBAL->GRXSTSP) = 0;
+        ALIAS(OTG_FS_GLOBAL->GRXSTSR) = 0;
+        return;
+    }
+    const usb_rx_entry_t* e = &usb.queue[usb.head];
+    ALIAS(OTG_FS_GLOBAL->GRXSTSP) = e->status;
+    ALIAS(OTG_FS_GLOBAL->GRXSTSR) = e->status;
+    ALIAS(OTG_FS_GLOBAL->GINTSTS) |= OTG_GINTSTS_RXFLVL;
+}
+
+static void usb_rx_push(uint32_t pktsts, unsigned ep, const uint8_t* data, unsigned bcnt)
+{
+    if (usb.count >= USB_RX_QUEUE)
+    {
+        fprintf(stderr, "usb model: receive queue overflow\n");
+        abort();
+    }
+    usb_rx_entry_t* e = &usb.queue[(usb.head + usb.count) % USB_RX_QUEUE];
+    memset(e, 0, sizeof(*e));
+    e->status = (pktsts << OTG_GRXSTSP_PKTSTS_POS) | (bcnt << OTG_GRXSTSP_BCNT_POS) | ep;
+    e->nwords = (bcnt + 3U) / 4U;
+    if (bcnt)
+    {
+        memcpy(e->words, data, bcnt);
+    }
+    usb.count++;
+    usb_rx_expose();
+}
+
+/** @brief Word the next FIFO read returns: the head of the popped entry's payload. */
+static void usb_fifo_expose(void)
+{
+    *usb_alias(OTG_FS_FIFO_BASE) =
+        (usb.current_read < usb.current.nwords) ? usb.current.words[usb.current_read] : 0xDEADBEEFU;
+}
+
+static void usb_on_grxstsp_pop(uintptr_t addr)
+{
+    if (usb.count == 0U)
+    {
+        violation(addr, "GRXSTSP popped with RXFLVL=0: nothing in the receive FIFO");
+        return;
+    }
+    if (usb.current_read < usb.current.nwords)
+    {
+        violation(addr, "next status popped before the previous packet's %u words were read",
+                  usb.current.nwords - usb.current_read);
+    }
+    usb.current = usb.queue[usb.head];
+    usb.current_read = 0;
+    usb.head = (usb.head + 1U) % USB_RX_QUEUE;
+    usb.count--;
+    usb_fifo_expose();
+    usb_rx_expose();
+
+    const unsigned ep = FIELD(usb.current.status, OTG_GRXSTSP_EPNUM_MSK, OTG_GRXSTSP_EPNUM_POS);
+    switch (FIELD(usb.current.status, OTG_GRXSTSP_PKTSTS_MSK, OTG_GRXSTSP_PKTSTS_POS))
+    {
+        case OTG_PKTSTS_SETUP_COMPLETE:
+            /* RM0383 22.17.5: STUP follows the setup-complete pop. */
+            usb_raise_out(0, OTG_DOEPINT_STUP);
+            break;
+        case OTG_PKTSTS_OUT_COMPLETE:
+            ALIAS(OTG_FS_DEVICE->OUTEP[ep].DOEPCTL) &= ~OTG_DOEPCTL_EPENA;
+            usb_raise_out(ep, OTG_DOEPINT_XFRC);
+            break;
+        default:
+            break;
+    }
+}
+
+static void usb_irq(void)
+{
+    for (int i = 0; i < 32; i++)
+    {
+        if (!(ALIAS(OTG_FS_GLOBAL->GAHBCFG) & OTG_GAHBCFG_GINT) ||
+            !(ALIAS(OTG_FS_GLOBAL->GINTSTS) & ALIAS(OTG_FS_GLOBAL->GINTMSK)))
+        {
+            return;
+        }
+        usb.irqs++;
+        DRIVE(OTG_FS_IRQHandler());
+    }
+    /* Something is pending that the handler never clears: report it once. */
+    violation(OTG_FS_GLOBAL_BASE + offsetof(otg_fs_global_regs_t, GINTSTS),
+              "interrupt storm: GINTSTS=0x%08X still pending after 32 handler runs",
+              ALIAS(OTG_FS_GLOBAL->GINTSTS) & ALIAS(OTG_FS_GLOBAL->GINTMSK));
+    ALIAS(OTG_FS_GLOBAL->GINTMSK) = 0;
+}
+
+/* -- register-level model and rules -------------------------------------- */
+
+static void usb_check_fifo_layout(uintptr_t addr)
+{
+    const uint32_t rx = FIELD(ALIAS(OTG_FS_GLOBAL->GRXFSIZ), OTG_GRXFSIZ_RXFD_MSK, OTG_GRXFSIZ_RXFD_POS);
+    uint32_t next = rx;
+    if (rx < 16U)
+    {
+        violation(addr, "GRXFSIZ %u words; the receive FIFO must be at least 16", rx);
+    }
+    for (unsigned ep = 0; ep < OTG_FS_EP_COUNT; ep++)
+    {
+        const uint32_t reg = (ep == 0U) ? ALIAS(OTG_FS_GLOBAL->DIEPTXF0)
+                           : (ep == 1U) ? ALIAS(OTG_FS_GLOBAL->DIEPTXF1)
+                           : (ep == 2U) ? ALIAS(OTG_FS_GLOBAL->DIEPTXF2)
+                                        : ALIAS(OTG_FS_GLOBAL->DIEPTXF3);
+        const uint32_t start = reg & 0xFFFFU;
+        const uint32_t depth = reg >> 16;
+        if (depth < 16U)
+        {
+            violation(addr, "TX FIFO %u is %u words deep; minimum is 16", ep, depth);
+        }
+        if (start < next)
+        {
+            violation(addr, "TX FIFO %u starts at word %u, overlapping the FIFO before it (ends at %u)",
+                      ep, start, next);
+        }
+        next = start + depth;
+    }
+    if (next > OTG_FS_FIFO_RAM_WORDS)
+    {
+        violation(addr, "FIFO layout ends at word %u; the core has %u words of packet RAM", next,
+                  OTG_FS_FIFO_RAM_WORDS);
+    }
+}
+
+static void usb_on_connect(uintptr_t addr)
+{
+    const uint32_t gccfg = ALIAS(OTG_FS_GLOBAL->GCCFG);
+    const uint32_t gusbcfg = ALIAS(OTG_FS_GLOBAL->GUSBCFG);
+    const uint32_t gintmsk = ALIAS(OTG_FS_GLOBAL->GINTMSK);
+
+    if (!(gccfg & OTG_GCCFG_PWRDWN))
+    {
+        violation(addr, "SDIS cleared with GCCFG.PWRDWN=0: the transceiver is powered down");
+    }
+    if (!(gccfg & OTG_GCCFG_NOVBUSSENS) && !(gccfg & OTG_GCCFG_VBUSBSEN))
+    {
+        violation(addr, "neither NOVBUSSENS nor VBUSBSEN set: the core will never see a session");
+    }
+    if (!(gusbcfg & OTG_GUSBCFG_FDMOD))
+    {
+        violation(addr, "connecting without forcing device mode (GUSBCFG.FDMOD)");
+    }
+    else if (sim_cycles - usb.fdmod_at < (uint64_t)BSP_HCLK_HZ / 40U)
+    {
+        violation(addr, "SDIS cleared %llu cycles after FDMOD; RM0383 22.15.4 says wait 25 ms = %u cycles",
+                  (unsigned long long)(sim_cycles - usb.fdmod_at), (unsigned)(BSP_HCLK_HZ / 40U));
+    }
+    if (!(gusbcfg & OTG_GUSBCFG_PHYSEL))
+    {
+        violation(addr, "GUSBCFG.PHYSEL not set; the F411 only has the full-speed serial transceiver");
+    }
+    if (FIELD(ALIAS(OTG_FS_DEVICE->DCFG), OTG_DCFG_DSPD_MSK, OTG_DCFG_DSPD_POS) != OTG_DSPD_FULL_SPEED)
+    {
+        violation(addr, "DCFG.DSPD is not 0b11 (full speed with the internal PHY)");
+    }
+    if (!(ALIAS(OTG_FS_GLOBAL->GAHBCFG) & OTG_GAHBCFG_GINT))
+    {
+        violation(addr, "connected with GAHBCFG.GINT=0: no interrupt will ever fire");
+    }
+    if (!(gintmsk & OTG_GINTMSK_USBRST) || !(gintmsk & OTG_GINTMSK_ENUMDNEM) ||
+        !(gintmsk & OTG_GINTMSK_RXFLVLM) || !(gintmsk & OTG_GINTMSK_IEPINT) ||
+        !(gintmsk & OTG_GINTMSK_OEPINT))
+    {
+        violation(addr, "connected with GINTMSK=0x%08X; USBRST, ENUMDNE, RXFLVL, IEPINT and OEPINT are all needed", gintmsk);
+    }
+    if (FIELD(ALIAS(OTG_FS_DEVICE->DCFG), OTG_DCFG_DAD_MSK, OTG_DCFG_DAD_POS) != 0U)
+    {
+        violation(addr, "connected with a non-zero device address");
+    }
+    usb_check_fifo_layout(addr);
+    usb.connected = true;
+}
+
+static void sim_usb_global(uintptr_t addr, int write, uint32_t before, uint32_t after)
+{
+    otg_fs_global_regs_t* g = OTG_FS_GLOBAL;
+
+    if (!write)
+    {
+        if (addr == (uintptr_t)&g->GRXSTSP)
+        {
+            usb_on_grxstsp_pop(addr);
+        }
+        return;
+    }
+
+    if (addr == (uintptr_t)&g->GRSTCTL)
+    {
+        /* Resets and flushes complete at once; AHBIDL is always true here. */
+        uint32_t v = after;
+        if (after & OTG_GRSTCTL_CSRST)
+        {
+            if (!(before & OTG_GRSTCTL_AHBIDL))
+            {
+                violation(addr, "CSRST issued without checking AHBIDL first");
+            }
+            if (!(ALIAS(g->GUSBCFG) & OTG_GUSBCFG_PHYSEL))
+            {
+                violation(addr, "core soft reset before PHYSEL: the PHY choice is latched by the reset");
+            }
+            v &= ~OTG_GRSTCTL_CSRST;
+            usb.fdmod_seen = false;
+        }
+        if (after & OTG_GRSTCTL_TXFFLSH)
+        {
+            const uint32_t num = FIELD(after, OTG_GRSTCTL_TXFNUM_MSK, OTG_GRSTCTL_TXFNUM_POS);
+            for (unsigned ep = 0; ep < OTG_FS_EP_COUNT; ep++)
+            {
+                if (num == OTG_TXFNUM_ALL || num == ep)
+                {
+                    usb.tx[ep].nbytes = 0;
+                    ALIAS(OTG_FS_DEVICE->INEP[ep].DTXFSTS) = usb_tx_depth_words(ep);
+                }
+            }
+            v &= ~OTG_GRSTCTL_TXFFLSH;
+        }
+        if (after & OTG_GRSTCTL_RXFFLSH)
+        {
+            usb.count = 0;
+            usb.current.nwords = 0;
+            usb.current_read = 0;
+            usb_rx_expose();
+            v &= ~OTG_GRSTCTL_RXFFLSH;
+        }
+        ALIAS(g->GRSTCTL) = v | OTG_GRSTCTL_AHBIDL;
+    }
+    else if (addr == (uintptr_t)&g->GUSBCFG)
+    {
+        if ((after & OTG_GUSBCFG_FDMOD) && !(before & OTG_GUSBCFG_FDMOD))
+        {
+            usb.fdmod_at = sim_cycles;
+            usb.fdmod_seen = true;
+        }
+        if ((after & OTG_GUSBCFG_FDMOD) && (after & OTG_GUSBCFG_FHMOD))
+        {
+            violation(addr, "FDMOD and FHMOD both set");
+        }
+        /* RM0383 22.15.4 TRDT table for the FS core, from the AHB clock. */
+        const uint32_t trdt = FIELD(after, OTG_GUSBCFG_TRDT_MSK, OTG_GUSBCFG_TRDT_POS);
+        const uint32_t hclk_mhz = BSP_HCLK_HZ / 1000000U;
+        const uint32_t want = hclk_mhz >= 32U ? 6U : hclk_mhz >= 27U ? 7U : hclk_mhz >= 24U ? 8U
+                            : hclk_mhz >= 21U ? 9U : hclk_mhz >= 20U ? 10U : hclk_mhz >= 18U ? 11U
+                            : hclk_mhz >= 17U ? 12U : hclk_mhz >= 16U ? 13U : hclk_mhz >= 15U ? 14U : 15U;
+        if ((after & OTG_GUSBCFG_FDMOD) && trdt != want)
+        {
+            violation(addr, "TRDT=%u for HCLK %u MHz; RM0383 22.15.4 table wants %u", trdt, hclk_mhz, want);
+        }
+    }
+    else if (addr == (uintptr_t)&g->GINTSTS)
+    {
+        /* Write one to clear, except the pure status bits. */
+        const uint32_t ro = OTG_GINTSTS_CMOD | OTG_GINTSTS_OTGINT | OTG_GINTSTS_RXFLVL |
+                            OTG_GINTSTS_NPTXFE | OTG_GINTSTS_GINAKEFF | OTG_GINTSTS_GOUTNAKEFF |
+                            OTG_GINTSTS_IEPINT | OTG_GINTSTS_OEPINT | OTG_GINTSTS_HPRTINT |
+                            OTG_GINTSTS_PTXFE;
+        ALIAS(g->GINTSTS) = before & ~(after & ~ro);
+    }
+    else if (addr == (uintptr_t)&g->GRXFSIZ || addr == (uintptr_t)&g->DIEPTXF0 ||
+             addr == (uintptr_t)&g->DIEPTXF1 || addr == (uintptr_t)&g->DIEPTXF2 ||
+             addr == (uintptr_t)&g->DIEPTXF3)
+    {
+        if (usb.connected)
+        {
+            violation(addr, "FIFO layout changed while connected");
+        }
+        for (unsigned ep = 0; ep < OTG_FS_EP_COUNT; ep++)
+        {
+            ALIAS(OTG_FS_DEVICE->INEP[ep].DTXFSTS) = usb_tx_depth_words(ep);
+        }
+    }
+    else if (addr == (uintptr_t)&g->GCCFG)
+    {
+        if ((after & OTG_GCCFG_PWRDWN) && !(before & OTG_GCCFG_PWRDWN) &&
+            !(ALIAS(g->GUSBCFG) & OTG_GUSBCFG_PHYSEL))
+        {
+            violation(addr, "transceiver powered up before PHYSEL was chosen");
+        }
+    }
+}
+
+static void sim_usb_device(uintptr_t addr, int write, uint32_t before, uint32_t after)
+{
+    otg_fs_device_regs_t* d = OTG_FS_DEVICE;
+    if (!write)
+    {
+        return;
+    }
+
+    if (addr == (uintptr_t)&d->DCTL)
+    {
+        if ((before & OTG_DCTL_SDIS) && !(after & OTG_DCTL_SDIS))
+        {
+            usb_on_connect(addr);
+        }
+        if (!(before & OTG_DCTL_SDIS) && (after & OTG_DCTL_SDIS))
+        {
+            usb.connected = false;
+        }
+        uint32_t gint = ALIAS(OTG_FS_GLOBAL->GINTSTS);
+        if (after & OTG_DCTL_SGONAK) { gint |= OTG_GINTSTS_GOUTNAKEFF; }
+        if (after & OTG_DCTL_CGONAK) { gint &= ~OTG_GINTSTS_GOUTNAKEFF; }
+        if (after & OTG_DCTL_SGINAK) { gint |= OTG_GINTSTS_GINAKEFF; }
+        if (after & OTG_DCTL_CGINAK) { gint &= ~OTG_GINTSTS_GINAKEFF; }
+        ALIAS(OTG_FS_GLOBAL->GINTSTS) = gint;
+        /* The set/clear pulse bits read back as zero. */
+        ALIAS(d->DCTL) = after & ~(OTG_DCTL_SGONAK | OTG_DCTL_CGONAK | OTG_DCTL_SGINAK | OTG_DCTL_CGINAK);
+        return;
+    }
+    if (addr == (uintptr_t)&d->DCFG)
+    {
+        if (usb.connected && ((before ^ after) & OTG_DCFG_DSPD_MSK))
+        {
+            violation(addr, "DCFG.DSPD changed while connected");
+        }
+        return;
+    }
+
+    /* Endpoint registers. */
+    if (addr >= (uintptr_t)&d->INEP[0] && addr < (uintptr_t)&d->INEP[OTG_FS_EP_COUNT])
+    {
+        const size_t off = addr - (uintptr_t)&d->INEP[0];
+        const unsigned ep = (unsigned)(off / sizeof(otg_fs_inep_regs_t));
+        const size_t reg = off % sizeof(otg_fs_inep_regs_t);
+        otg_fs_inep_regs_t* in = &d->INEP[ep];
+
+        if (reg == offsetof(otg_fs_inep_regs_t, DIEPCTL))
+        {
+            /* NAKSTS is read-only: whatever a read-modify-write copies back is
+             * ignored; only SNAK/CNAK move it. */
+            uint32_t v = (after & ~(OTG_DIEPCTL_CNAK | OTG_DIEPCTL_SNAK | OTG_DIEPCTL_SD0PID_SEVNFRM |
+                                    OTG_DIEPCTL_NAKSTS)) | (before & OTG_DIEPCTL_NAKSTS);
+            if (after & OTG_DIEPCTL_SNAK)
+            {
+                v |= OTG_DIEPCTL_NAKSTS;
+                usb_raise_in(ep, OTG_DIEPINT_INEPNE);
+            }
+            if (after & OTG_DIEPCTL_CNAK)
+            {
+                v &= ~OTG_DIEPCTL_NAKSTS;
+            }
+            if ((after & OTG_DIEPCTL_EPDIS) && (before & OTG_DIEPCTL_EPENA))
+            {
+                v &= ~(OTG_DIEPCTL_EPENA | OTG_DIEPCTL_EPDIS);
+                usb.tx[ep].armed = false;
+                usb_raise_in(ep, OTG_DIEPINT_EPDISD);
+            }
+            else if (after & OTG_DIEPCTL_EPDIS)
+            {
+                v &= ~OTG_DIEPCTL_EPDIS;
+            }
+            if ((after & OTG_DIEPCTL_EPENA) && !(before & OTG_DIEPCTL_EPENA))
+            {
+                const uint32_t tsiz = ALIAS(in->DIEPTSIZ);
+                usb.tx[ep].armed = true;
+                usb.tx[ep].armed_at = sim_cycles;
+                usb.tx[ep].nbytes = 0;
+                usb.tx[ep].xfrsiz = FIELD(tsiz, OTG_DIEPTSIZ_XFRSIZ_MSK, OTG_DIEPTSIZ_XFRSIZ_POS);
+                usb.tx[ep].pktcnt = FIELD(tsiz, OTG_DIEPTSIZ_PKTCNT_MSK, OTG_DIEPTSIZ_PKTCNT_POS);
+                if (ep == 0U)
+                {
+                    usb.tx[ep].xfrsiz &= 0x7FU;
+                    usb.tx[ep].pktcnt &= 0x3U;
+                }
+                if (usb.tx[ep].pktcnt == 0U)
+                {
+                    violation(addr, "IN EP%u enabled with PKTCNT=0: nothing would be sent", ep);
+                }
+                if (ep != 0U && !(after & OTG_DIEPCTL_USBAEP))
+                {
+                    violation(addr, "IN EP%u enabled without USBAEP", ep);
+                }
+                const uint32_t mps = (ep == 0U) ? 64U : FIELD(after, OTG_DIEPCTL_MPSIZ_MSK, OTG_DIEPCTL_MPSIZ_POS);
+                const uint32_t need = (usb.tx[ep].xfrsiz + mps - 1U) / mps;
+                if (usb.tx[ep].xfrsiz != 0U && need != usb.tx[ep].pktcnt)
+                {
+                    violation(addr, "IN EP%u: XFRSIZ=%u needs PKTCNT=%u at MPS %u, got %u", ep,
+                              usb.tx[ep].xfrsiz, need, mps, usb.tx[ep].pktcnt);
+                }
+                if (ep != 0U && FIELD(after, OTG_DIEPCTL_TXFNUM_MSK, OTG_DIEPCTL_TXFNUM_POS) != ep)
+                {
+                    violation(addr, "IN EP%u uses TX FIFO %u; this driver's layout gives each EP its own", ep,
+                              (unsigned)FIELD(after, OTG_DIEPCTL_TXFNUM_MSK, OTG_DIEPCTL_TXFNUM_POS));
+                }
+            }
+            if ((before & OTG_DIEPCTL_EPENA) && (after & OTG_DIEPCTL_EPENA) &&
+                ((before ^ after) & (OTG_DIEPCTL_MPSIZ_MSK | OTG_DIEPCTL_EPTYP_MSK | OTG_DIEPCTL_TXFNUM_MSK)))
+            {
+                violation(addr, "IN EP%u type/size/FIFO changed while EPENA=1", ep);
+            }
+            ALIAS(in->DIEPCTL) = v;
+        }
+        else if (reg == offsetof(otg_fs_inep_regs_t, DIEPINT))
+        {
+            ALIAS(in->DIEPINT) = before & ~(after & ~OTG_DIEPINT_TXFE);
+            usb_refresh_ep_summary();
+        }
+        else if (reg == offsetof(otg_fs_inep_regs_t, DIEPTSIZ))
+        {
+            if (before != after && (ALIAS(in->DIEPCTL) & OTG_DIEPCTL_EPENA))
+            {
+                violation(addr, "IN EP%u DIEPTSIZ written while EPENA=1", ep);
+            }
+        }
+        return;
+    }
+
+    if (addr >= (uintptr_t)&d->OUTEP[0] && addr < (uintptr_t)&d->OUTEP[OTG_FS_EP_COUNT])
+    {
+        const size_t off = addr - (uintptr_t)&d->OUTEP[0];
+        const unsigned ep = (unsigned)(off / sizeof(otg_fs_outep_regs_t));
+        const size_t reg = off % sizeof(otg_fs_outep_regs_t);
+        otg_fs_outep_regs_t* out = &d->OUTEP[ep];
+
+        if (reg == offsetof(otg_fs_outep_regs_t, DOEPCTL))
+        {
+            uint32_t v = (after & ~(OTG_DOEPCTL_CNAK | OTG_DOEPCTL_SNAK | OTG_DOEPCTL_SD0PID_SEVNFRM |
+                                    OTG_DOEPCTL_NAKSTS)) | (before & OTG_DOEPCTL_NAKSTS);
+            if (after & OTG_DOEPCTL_SNAK) { v |= OTG_DOEPCTL_NAKSTS; }
+            if (after & OTG_DOEPCTL_CNAK) { v &= ~OTG_DOEPCTL_NAKSTS; }
+            if ((after & OTG_DOEPCTL_EPDIS) && (before & OTG_DOEPCTL_EPENA))
+            {
+                if (!(ALIAS(OTG_FS_GLOBAL->GINTSTS) & OTG_GINTSTS_GOUTNAKEFF))
+                {
+                    violation(addr, "OUT EP%u disabled without global OUT NAK in effect (RM0383 22.17.6)", ep);
+                }
+                v &= ~(OTG_DOEPCTL_EPENA | OTG_DOEPCTL_EPDIS);
+                usb_raise_out(ep, OTG_DOEPINT_EPDISD);
+            }
+            else if (after & OTG_DOEPCTL_EPDIS)
+            {
+                v &= ~OTG_DOEPCTL_EPDIS;
+            }
+            if ((after & OTG_DOEPCTL_EPENA) && !(before & OTG_DOEPCTL_EPENA))
+            {
+                const uint32_t tsiz = ALIAS(out->DOEPTSIZ);
+                if (FIELD(tsiz, OTG_DOEPTSIZ_PKTCNT_MSK, OTG_DOEPTSIZ_PKTCNT_POS) == 0U)
+                {
+                    violation(addr, "OUT EP%u enabled with PKTCNT=0", ep);
+                }
+                if (ep != 0U && !(after & OTG_DOEPCTL_USBAEP))
+                {
+                    violation(addr, "OUT EP%u enabled without USBAEP", ep);
+                }
+                if (v & OTG_DOEPCTL_NAKSTS)
+                {
+                    violation(addr, "OUT EP%u enabled while still NAKing (no CNAK)", ep);
+                }
+            }
+            ALIAS(out->DOEPCTL) = v;
+        }
+        else if (reg == offsetof(otg_fs_outep_regs_t, DOEPINT))
+        {
+            ALIAS(out->DOEPINT) = before & ~after;
+            usb_refresh_ep_summary();
+        }
+        return;
+    }
+}
+
+static void sim_usb_fifo(uintptr_t addr, int write, uint32_t after)
+{
+    const unsigned ep = (unsigned)((addr - OTG_FS_FIFO_BASE) / USB_FIFO_PAGE);
+
+    if (!write)
+    {
+        /* Any FIFO address pops the shared receive FIFO. */
+        if (usb.current_read >= usb.current.nwords)
+        {
+            violation(addr, "FIFO read past the %u words of the current packet", usb.current.nwords);
+            return;
+        }
+        usb.current_read++;
+        usb_fifo_expose();
+        return;
+    }
+
+    if (ep >= OTG_FS_EP_COUNT)
+    {
+        violation(addr, "write to FIFO %u; the core has 4", ep);
+        return;
+    }
+    otg_fs_inep_regs_t* in = &OTG_FS_DEVICE->INEP[ep];
+    if (!(ALIAS(in->DIEPCTL) & OTG_DIEPCTL_EPENA) || !usb.tx[ep].armed)
+    {
+        violation(addr, "TX FIFO %u written while IN EP%u is not enabled", ep, ep);
+        return;
+    }
+    if (usb.tx[ep].nbytes + 4U > ((usb.tx[ep].xfrsiz + 3U) & ~3U))
+    {
+        violation(addr, "TX FIFO %u: more words written than XFRSIZ=%u needs", ep, usb.tx[ep].xfrsiz);
+        return;
+    }
+    const uint32_t free_words = ALIAS(in->DTXFSTS) & OTG_DTXFSTS_INEPTFSAV_MSK;
+    if (free_words == 0U)
+    {
+        violation(addr, "TX FIFO %u overflow: written with INEPTFSAV=0", ep);
+        return;
+    }
+    ALIAS(in->DTXFSTS) = free_words - 1U;
+    memcpy(&usb.tx[ep].bytes[usb.tx[ep].nbytes], &after, 4U);
+    usb.tx[ep].nbytes += 4U;
+}
+
+static void sim_usb(uintptr_t addr, int write, uint32_t before, uint32_t after)
+{
+    if (addr >= OTG_FS_FIFO_BASE)
+    {
+        sim_usb_fifo(addr, write, after);
+    }
+    else if (addr >= OTG_FS_DEVICE_BASE && addr < OTG_FS_PWRCLK_BASE)
+    {
+        sim_usb_device(addr, write, before, after);
+    }
+    else if (addr >= OTG_FS_HOST_BASE && addr < OTG_FS_DEVICE_BASE)
+    {
+        violation(addr, "host-mode register touched by a device-only driver");
+    }
+    else if (addr < OTG_FS_HOST_BASE)
+    {
+        sim_usb_global(addr, write, before, after);
+    }
+}
+
+/* -- host-side operations ------------------------------------------------ */
+
+/** @brief Bus reset followed by speed enumeration, as the hub does on attach. */
+static void host_reset(void)
+{
+    if (ALIAS(OTG_FS_DEVICE->DCTL) & OTG_DCTL_SDIS)
+    {
+        violation(OTG_FS_DEVICE_BASE, "host reset while the device is soft-disconnected (nothing to reset)");
+        return;
+    }
+    usb.count = 0;
+    usb.current.nwords = 0;
+    usb.current_read = 0;
+    usb_rx_expose();
+    ALIAS(OTG_FS_GLOBAL->GINTSTS) |= OTG_GINTSTS_USBRST;
+    usb_irq();
+    ALIAS(OTG_FS_DEVICE->DSTS) = OTG_DSPD_FULL_SPEED << OTG_DSTS_ENUMSPD_POS;
+    ALIAS(OTG_FS_GLOBAL->GINTSTS) |= OTG_GINTSTS_ENUMDNE;
+    usb_irq();
+}
+
+typedef enum { HOST_ACK = 0, HOST_STALL = 1, HOST_NAK = 2 } host_result_t;
+
+/**
+ * @brief IN token on @p ep: collect one transfer as the device has it armed.
+ *
+ * Returns the bytes the device had in its FIFO, checking that they cover
+ * XFRSIZ, then completes the transfer the way the core does (EPENA clears,
+ * XFRC fires) and runs the interrupt handler.
+ */
+static host_result_t host_in(unsigned ep, uint8_t* data, unsigned* length)
+{
+    otg_fs_inep_regs_t* in = &OTG_FS_DEVICE->INEP[ep];
+    const uint32_t ctl = ALIAS(in->DIEPCTL);
+    usb.in_tokens++;
+    *length = 0;
+
+    if (ctl & OTG_DIEPCTL_STALL)
+    {
+        return HOST_STALL;
+    }
+    if (!(ctl & OTG_DIEPCTL_EPENA) || (ctl & OTG_DIEPCTL_NAKSTS) || !usb.tx[ep].armed)
+    {
+        return HOST_NAK;
+    }
+    if (usb.tx[ep].nbytes < usb.tx[ep].xfrsiz)
+    {
+        violation((uintptr_t)&in->DIEPCTL,
+                  "IN EP%u token with %u of %u bytes in the FIFO: the core would NAK until the rest is written",
+                  ep, usb.tx[ep].nbytes, usb.tx[ep].xfrsiz);
+        return HOST_NAK;
+    }
+    memcpy(data, usb.tx[ep].bytes, usb.tx[ep].xfrsiz);
+    *length = usb.tx[ep].xfrsiz;
+
+    usb.tx[ep].armed = false;
+    usb.tx[ep].nbytes = 0;
+    ALIAS(in->DIEPCTL) = ctl & ~OTG_DIEPCTL_EPENA;
+    ALIAS(in->DIEPTSIZ) = 0;
+    ALIAS(in->DTXFSTS) = usb_tx_depth_words(ep);
+    usb_raise_in(ep, OTG_DIEPINT_XFRC);
+    usb_irq();
+    return HOST_ACK;
+}
+
+/** @brief OUT token with one data packet on @p ep. */
+static host_result_t host_out(unsigned ep, const uint8_t* data, unsigned length)
+{
+    otg_fs_outep_regs_t* out = &OTG_FS_DEVICE->OUTEP[ep];
+    const uint32_t ctl = ALIAS(out->DOEPCTL);
+    usb.out_tokens++;
+
+    if (ctl & OTG_DOEPCTL_STALL)
+    {
+        return HOST_STALL;
+    }
+    if (!(ctl & OTG_DOEPCTL_EPENA) || (ctl & OTG_DOEPCTL_NAKSTS))
+    {
+        return HOST_NAK;
+    }
+    const uint32_t tsiz = ALIAS(out->DOEPTSIZ);
+    const uint32_t xfrsiz = FIELD(tsiz, OTG_DOEPTSIZ_XFRSIZ_MSK, OTG_DOEPTSIZ_XFRSIZ_POS) & (ep == 0U ? 0x7FU : ~0U);
+    const uint32_t mps = (ep == 0U) ? 64U : FIELD(ctl, OTG_DOEPCTL_MPSIZ_MSK, OTG_DOEPCTL_MPSIZ_POS);
+    if (length > mps)
+    {
+        fprintf(stderr, "host model: packet of %u bytes exceeds MPS %u\n", length, mps);
+        abort();
+    }
+    if (length > xfrsiz)
+    {
+        violation((uintptr_t)&out->DOEPTSIZ, "OUT EP%u armed for %u bytes but a %u-byte packet arrived: overflow",
+                  ep, xfrsiz, length);
+    }
+
+    usb_rx_push(OTG_PKTSTS_OUT_DATA, ep, data, length);
+    usb_irq();
+    /* One packet per armed transfer in this driver, or a short packet: either
+     * way the transfer completes now. */
+    usb_rx_push(OTG_PKTSTS_OUT_COMPLETE, ep, NULL, 0);
+    usb_irq();
+    return HOST_ACK;
+}
+
+/** @brief Full control transfer on EP0, host side. */
+static host_result_t host_control(uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue,
+                                  uint16_t wIndex, uint16_t wLength, const uint8_t* out_data,
+                                  uint8_t* in_data, unsigned* in_length)
+{
+    otg_fs_inep_regs_t* in0 = &OTG_FS_DEVICE->INEP[0];
+    otg_fs_outep_regs_t* out0 = &OTG_FS_DEVICE->OUTEP[0];
+    uint8_t setup[8] = {bmRequestType, bRequest, (uint8_t)wValue, (uint8_t)(wValue >> 8),
+                        (uint8_t)wIndex, (uint8_t)(wIndex >> 8), (uint8_t)wLength, (uint8_t)(wLength >> 8)};
+    unsigned total = 0;
+    if (in_length) { *in_length = 0; }
+
+    /* SETUP: accepted regardless of EPENA, as long as STUPCNT allows it. The
+     * core drops any STALL on EP0 when a SETUP arrives. */
+    if (FIELD(ALIAS(out0->DOEPTSIZ), OTG_DOEPTSIZ_RXDPID_STUPCNT_MSK, OTG_DOEPTSIZ_RXDPID_STUPCNT_POS) == 0U)
+    {
+        violation((uintptr_t)&out0->DOEPTSIZ, "SETUP arrived with DOEPTSIZ0.STUPCNT=0: the core cannot store it");
+    }
+    ALIAS(in0->DIEPCTL) &= ~OTG_DIEPCTL_STALL;
+    ALIAS(out0->DOEPCTL) &= ~OTG_DOEPCTL_STALL;
+    usb.tx[0].armed = false;
+    usb_rx_push(OTG_PKTSTS_SETUP_DATA, 0, setup, 8);
+    usb_irq();
+    usb_rx_push(OTG_PKTSTS_SETUP_COMPLETE, 0, NULL, 0);
+    usb_irq();
+
+    if ((ALIAS(in0->DIEPCTL) & OTG_DIEPCTL_STALL) || (ALIAS(out0->DOEPCTL) & OTG_DOEPCTL_STALL))
+    {
+        return HOST_STALL;
+    }
+
+    if (bmRequestType & 0x80U)
+    {
+        /* Data stage IN: keep asking until a short packet or wLength. */
+        for (int guard = 0; guard < 64; guard++)
+        {
+            uint8_t packet[64];
+            unsigned got = 0;
+            const host_result_t r = host_in(0, packet, &got);
+            if (r != HOST_ACK)
+            {
+                return r;
+            }
+            if (in_data && total + got <= 1024U)
+            {
+                memcpy(in_data + total, packet, got);
+            }
+            total += got;
+            if (got < 64U || total >= wLength)
+            {
+                break;
+            }
+        }
+        if (in_length) { *in_length = total; }
+
+        /* Status stage: an empty OUT packet. */
+        if (!(ALIAS(out0->DOEPCTL) & OTG_DOEPCTL_EPENA))
+        {
+            violation((uintptr_t)&out0->DOEPCTL, "control IN done but EP0 OUT not armed for the status stage");
+            return HOST_NAK;
+        }
+        return host_out(0, NULL, 0);
+    }
+
+    if (wLength != 0U)
+    {
+        /* Data stage OUT (single packet is all the driver supports). */
+        const host_result_t r = host_out(0, out_data, wLength);
+        if (r != HOST_ACK)
+        {
+            return r;
+        }
+    }
+
+    /* Status stage: an empty IN packet from the device. */
+    if (bRequest == USB_REQ_SET_ADDRESS && (bmRequestType & 0x7FU) == 0U)
+    {
+        /* RM0383 22.17.5: DCFG.DAD must already hold the new address when
+         * the status IN goes out; the core applies it on that handshake. */
+        const uint32_t dad = FIELD(ALIAS(OTG_FS_DEVICE->DCFG), OTG_DCFG_DAD_MSK, OTG_DCFG_DAD_POS);
+        if (dad != wValue)
+        {
+            violation((uintptr_t)&OTG_FS_DEVICE->DCFG, "status IN for SET_ADDRESS(%u) with DCFG.DAD=%u", wValue, dad);
+        }
+    }
+    uint8_t dummy[64];
+    unsigned got = 0;
+    const host_result_t r = host_in(0, dummy, &got);
+    if (r == HOST_ACK && got != 0U)
+    {
+        violation((uintptr_t)&in0->DIEPTSIZ, "status IN carried %u bytes instead of a zero-length packet", got);
+    }
+    if (r == HOST_ACK && (ALIAS(in0->DIEPCTL) & OTG_DIEPCTL_STALL))
+    {
+        return HOST_STALL;
+    }
+    return r;
+}
+
 /* -- dispatcher ---------------------------------------------------------- */
 
 static void on_access(uintptr_t addr, int write, uint32_t before, uint32_t after)
@@ -761,6 +2364,12 @@ static void on_access(uintptr_t addr, int write, uint32_t before, uint32_t after
             break;
         case I2C1_BASE: case I2C2_BASE: case I2C3_BASE:
             sim_i2c(addr, (i2c_regs_t*)p->base, write, before, after);
+            break;
+        case SDIO_BASE:
+            sim_sdio(addr, write, before, after);
+            break;
+        case OTG_FS_BASE:
+            sim_usb(addr, write, before, after);
             break;
         default:
             break;
@@ -1220,6 +2829,295 @@ static void test_i2c(void)
     group_end();
 }
 
+/* -- SDIO / SD card ------------------------------------------------------- */
+
+static void check_sd_block_pattern(const char* what, const uint8_t* data, uint32_t first_block, uint32_t count)
+{
+    uint64_t mismatches = 0;
+    for (uint32_t b = 0; b < count; b++)
+    {
+        for (uint32_t i = 0; i < 512U; i++)
+        {
+            if (data[b * 512U + i] != (uint8_t)(0xA0U + first_block + b + i))
+            {
+                mismatches++;
+            }
+        }
+    }
+    check_eq(what, mismatches, 0);
+}
+
+static void test_sdio(void)
+{
+    group("SDIO / SD card");
+
+    static uint8_t buf[3 * 512];
+
+    check_eq("read before init reports ENOTREADY",
+             (uint64_t)(uint32_t)DRIVE(bsp_sd_read_blocks(0, buf, 1)), (uint32_t)BSP_SD_ENOTREADY);
+
+    /* --- SDHC card, physical layer v2 ------------------------------------ */
+    sd_insert(true);
+    DRIVE(bsp_sdio_init());
+    check_eq("SDIO clock enabled in APB2ENR", RCC->APB2ENR & RCC_APB2ENR_SDIOEN, RCC_APB2ENR_SDIOEN);
+    check_eq("bsp_sd_init() on an SDHC card", (uint64_t)(uint32_t)DRIVE(bsp_sd_init()), 0);
+    check_eq("card ready", bsp_sd_ready(), 1);
+
+    const bsp_sd_card_t* card = bsp_sd_card();
+    check_eq("SDHC: high_capacity", card->high_capacity, 1);
+    check_eq("SDHC: version_2", card->version_2, 1);
+    check_eq("SDHC: RCA from CMD3", card->rca, SD_MODEL_RCA);
+    check_eq("SDHC: block count from CSD v2", card->block_count, sd_model_block_count(true));
+
+    /* CLKDIV: SDIOCLK = PLL48CK; CK = SDIOCLK / (CLKDIV + 2). */
+    const uint32_t want_div = (BSP_PLL_Q_OUT_HZ + BSP_SDIO_CLK_HZ - 1U) / BSP_SDIO_CLK_HZ;
+    check_eq("CLKCR.CLKDIV for the data-transfer clock",
+             FIELD(SDIO->CLKCR, SDIO_CLKCR_CLKDIV_MSK, SDIO_CLKCR_CLKDIV_POS),
+             want_div >= 2U ? want_div - 2U : 0U);
+    check_eq("CLKCR.WIDBUS = 4-bit", FIELD(SDIO->CLKCR, SDIO_CLKCR_WIDBUS_MSK, SDIO_CLKCR_WIDBUS_POS),
+             BSP_SDIO_BUS_WIDTH == 4U ? 1U : 0U);
+    check_eq("CLKCR.CLKEN", SDIO->CLKCR & SDIO_CLKCR_CLKEN, SDIO_CLKCR_CLKEN);
+    check_eq("POWER.PWRCTRL = on", FIELD(SDIO->POWER, SDIO_POWER_PWRCTRL_MSK, SDIO_POWER_PWRCTRL_POS), 3);
+
+    memset(buf, 0, sizeof(buf));
+    check_eq("read 1 block", (uint64_t)(uint32_t)DRIVE(bsp_sd_read_blocks(2, buf, 1)), 0);
+    check_sd_block_pattern("block 2 contents", buf, 2, 1);
+
+    memset(buf, 0, sizeof(buf));
+    check_eq("read 3 blocks (CMD18 + CMD12)", (uint64_t)(uint32_t)DRIVE(bsp_sd_read_blocks(4, buf, 3)), 0);
+    check_sd_block_pattern("blocks 4..6 contents", buf, 4, 3);
+
+    for (uint32_t i = 0; i < 2U * 512U; i++)
+    {
+        buf[i] = (uint8_t)(0xA0U + 1U + (i / 512U) + i);
+    }
+    check_eq("write 2 blocks (CMD25 + CMD12)", (uint64_t)(uint32_t)DRIVE(bsp_sd_write_blocks(1, buf, 2)), 0);
+    memset(buf, 0, sizeof(buf));
+    check_eq("read back the 2 written blocks", (uint64_t)(uint32_t)DRIVE(bsp_sd_read_blocks(1, buf, 2)), 0);
+    check_sd_block_pattern("written data survived the round trip", buf, 1, 2);
+
+    check_eq("write past the end reports EPARAM",
+             (uint64_t)(uint32_t)DRIVE(bsp_sd_write_blocks(card->block_count - 1U, buf, 2)), (uint32_t)BSP_SD_EPARAM);
+    check_eq("count of 0 reports EPARAM", (uint64_t)(uint32_t)DRIVE(bsp_sd_read_blocks(0, buf, 0)), (uint32_t)BSP_SD_EPARAM);
+
+    /* --- SDSC card, physical layer v1 (no CMD8, byte addressing) --------- */
+    sd_insert(false);
+    check_eq("bsp_sd_init() on an SDSC v1 card", (uint64_t)(uint32_t)DRIVE(bsp_sd_init()), 0);
+    card = bsp_sd_card();
+    check_eq("SDSC: high_capacity clear", card->high_capacity, 0);
+    check_eq("SDSC: version_2 clear", card->version_2, 0);
+    check_eq("SDSC: block count from CSD v1", card->block_count, sd_model_block_count(false));
+    memset(buf, 0, sizeof(buf));
+    check_eq("SDSC: read block 3 (byte address)", (uint64_t)(uint32_t)DRIVE(bsp_sd_read_blocks(3, buf, 1)), 0);
+    check_sd_block_pattern("SDSC: block 3 contents", buf, 3, 1);
+
+    /* --- no card ----------------------------------------------------------- */
+    sd.present = false;
+    check_eq("bsp_sd_init() with no card reports ENOCARD", (uint64_t)(uint32_t)DRIVE(bsp_sd_init()),
+             (uint32_t)BSP_SD_ENOCARD);
+    check_eq("not ready after the failure", bsp_sd_ready(), 0);
+
+    group_end();
+}
+
+/* -- USB OTG_FS device + CDC-ACM ------------------------------------------ */
+
+static uint16_t le16(const uint8_t* p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static void test_usb(void)
+{
+    group("USB OTG_FS device / CDC-ACM");
+
+    static uint8_t in[1024];
+    unsigned got = 0;
+
+    DRIVE(bsp_usb_cdc_init());
+    check_eq("OTG_FS clock enabled in AHB2ENR", RCC->AHB2ENR & RCC_AHB2ENR_OTGFSEN, RCC_AHB2ENR_OTGFSEN);
+    check_eq("PA11 AF10 (OTG_FS_DM)", FIELD(GPIOA->AFR[1], 0xFU << 12, 12), 10);
+    check_eq("PA12 AF10 (OTG_FS_DP)", FIELD(GPIOA->AFR[1], 0xFU << 16, 16), 10);
+    check_eq("device mode forced (GUSBCFG.FDMOD)", OTG_FS_GLOBAL->GUSBCFG & OTG_GUSBCFG_FDMOD, OTG_GUSBCFG_FDMOD);
+    check_eq("full speed internal PHY (DCFG.DSPD=3)", FIELD(OTG_FS_DEVICE->DCFG, OTG_DCFG_DSPD_MSK, OTG_DCFG_DSPD_POS), 3);
+    check_eq("connected (DCTL.SDIS clear)", OTG_FS_DEVICE->DCTL & OTG_DCTL_SDIS, 0);
+    check_eq("not configured before enumeration", bsp_usb_configured(), 0);
+
+    host_reset();
+    check_eq("after reset: EP0 OUT armed for SETUP (STUPCNT=3)",
+             FIELD(OTG_FS_DEVICE->OUTEP[0].DOEPTSIZ, OTG_DOEPTSIZ_RXDPID_STUPCNT_MSK, OTG_DOEPTSIZ_RXDPID_STUPCNT_POS), 3);
+    check_eq("after reset: EP0 MPS = 64 (MPSIZ=0)",
+             FIELD(OTG_FS_DEVICE->INEP[0].DIEPCTL, OTG_DIEPCTL_MPSIZ_MSK, OTG_DIEPCTL_MPSIZ_POS) & 0x3U, 0);
+
+    /* Device descriptor: first the 8-byte probe a real host does, then all 18. */
+    check_eq("GET_DESCRIPTOR(device, 8) ACKed",
+             host_control(0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_DEVICE << 8, 0, 8, NULL, in, &got), HOST_ACK);
+    check_eq("  8 bytes returned", got, 8);
+    check_eq("  bMaxPacketSize0 = 64", in[7], 64);
+    check_eq("GET_DESCRIPTOR(device, 18) ACKed",
+             host_control(0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_DEVICE << 8, 0, 18, NULL, in, &got), HOST_ACK);
+    check_eq("  18 bytes returned", got, 18);
+    check_eq("  bLength/bDescriptorType", ((uint32_t)in[0] << 8) | in[1], 0x1201);
+    check_eq("  bcdUSB = 2.00", le16(&in[2]), 0x0200);
+    check_eq("  bDeviceClass = CDC (2)", in[4], 2);
+    check_eq("  idVendor", le16(&in[8]), BSP_USB_VID);
+    check_eq("  idProduct", le16(&in[10]), BSP_USB_PID);
+    check_eq("  bNumConfigurations = 1", in[17], 1);
+
+    check_eq("SET_ADDRESS(5) ACKed", host_control(0x00, USB_REQ_SET_ADDRESS, 5, 0, 0, NULL, NULL, NULL), HOST_ACK);
+    check_eq("  DCFG.DAD = 5", FIELD(OTG_FS_DEVICE->DCFG, OTG_DCFG_DAD_MSK, OTG_DCFG_DAD_POS), 5);
+
+    check_eq("GET_DESCRIPTOR(config, 9) ACKed",
+             host_control(0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_CONFIGURATION << 8, 0, 9, NULL, in, &got), HOST_ACK);
+    check_eq("  9 bytes returned", got, 9);
+    const uint16_t total = le16(&in[2]);
+    check_eq("  wTotalLength = 67", total, 67);
+    check_eq("  bNumInterfaces = 2", in[4], 2);
+    check_eq("  bConfigurationValue = 1", in[5], 1);
+    check_eq("  bmAttributes bit 7 set", in[7] & 0x80U, 0x80);
+    check_eq("  bMaxPower = mA/2", in[8], BSP_USB_MAX_POWER_MA / 2U);
+    check_eq("GET_DESCRIPTOR(config, full) ACKed",
+             host_control(0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_CONFIGURATION << 8, 0, total, NULL, in, &got), HOST_ACK);
+    check_eq("  wTotalLength bytes returned", got, total);
+    /* Walk the descriptor chain: every bLength must land exactly on the end. */
+    unsigned off = 0, endpoints = 0, cs_ifaces = 0;
+    while (off < got && in[off] != 0U)
+    {
+        if (in[off + 1] == USB_DESC_ENDPOINT) { endpoints++; }
+        if (in[off + 1] == USB_DESC_CS_INTERFACE) { cs_ifaces++; }
+        off += in[off];
+    }
+    check_eq("  descriptor chain is self-consistent", off, got);
+    check_eq("  3 endpoint descriptors", endpoints, 3);
+    check_eq("  4 CDC functional descriptors", cs_ifaces, 4);
+
+    check_eq("GET_DESCRIPTOR(string 0) ACKed",
+             host_control(0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_STRING << 8, 0, 255, NULL, in, &got), HOST_ACK);
+    check_eq("  LANGID 0x0409", le16(&in[2]), 0x0409);
+    check_eq("GET_DESCRIPTOR(string 2 = product) ACKed",
+             host_control(0x80, USB_REQ_GET_DESCRIPTOR, (USB_DESC_STRING << 8) | 2U, 0x0409, 255, NULL, in, &got), HOST_ACK);
+    check_eq("  UTF-16 length matches", in[0], 2U + 2U * strlen(BSP_USB_PRODUCT));
+    check_eq("  first character", in[2], (uint8_t)BSP_USB_PRODUCT[0]);
+    check_eq("GET_DESCRIPTOR(string 3 = serial) ACKed",
+             host_control(0x80, USB_REQ_GET_DESCRIPTOR, (USB_DESC_STRING << 8) | 3U, 0x0409, 255, NULL, in, &got), HOST_ACK);
+    check_eq("  serial is 24 hex digits from the UID", in[0], 2U + 2U * 24U);
+
+    check_eq("GET_DESCRIPTOR(device qualifier) STALLs (FS only)",
+             host_control(0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_DEVICE_QUALIFIER << 8, 0, 10, NULL, in, &got), HOST_STALL);
+    check_eq("unsupported vendor request STALLs",
+             host_control(0xC0, 0x42, 0, 0, 4, NULL, in, &got), HOST_STALL);
+    check_eq("device still answers after the STALL",
+             host_control(0x80, USB_REQ_GET_STATUS, 0, 0, 2, NULL, in, &got), HOST_ACK);
+    check_eq("  GET_STATUS(device) self-powered bit", in[0] & 1U, BSP_USB_SELF_POWERED);
+
+    check_eq("SET_CONFIGURATION(1) ACKed", host_control(0x00, USB_REQ_SET_CONFIGURATION, 1, 0, 0, NULL, NULL, NULL), HOST_ACK);
+    check_eq("  bsp_usb_configured()", bsp_usb_configured(), 1);
+    check_eq("  EP1 IN active, bulk, MPS 64",
+             OTG_FS_DEVICE->INEP[1].DIEPCTL & (OTG_DIEPCTL_USBAEP | OTG_DIEPCTL_EPTYP_MSK | OTG_DIEPCTL_MPSIZ_MSK),
+             OTG_DIEPCTL_USBAEP | (2UL << OTG_DIEPCTL_EPTYP_POS) | 64UL);
+    check_eq("  EP1 IN uses TX FIFO 1", FIELD(OTG_FS_DEVICE->INEP[1].DIEPCTL, OTG_DIEPCTL_TXFNUM_MSK, OTG_DIEPCTL_TXFNUM_POS), 1);
+    check_eq("  EP1 OUT active, bulk, MPS 64, armed",
+             OTG_FS_DEVICE->OUTEP[1].DOEPCTL & (OTG_DOEPCTL_USBAEP | OTG_DOEPCTL_EPTYP_MSK | OTG_DOEPCTL_MPSIZ_MSK | OTG_DOEPCTL_EPENA),
+             OTG_DOEPCTL_USBAEP | (2UL << OTG_DOEPCTL_EPTYP_POS) | 64UL | OTG_DOEPCTL_EPENA);
+    check_eq("  EP2 IN active, interrupt, MPS 8",
+             OTG_FS_DEVICE->INEP[2].DIEPCTL & (OTG_DIEPCTL_USBAEP | OTG_DIEPCTL_EPTYP_MSK | OTG_DIEPCTL_MPSIZ_MSK),
+             OTG_DIEPCTL_USBAEP | (3UL << OTG_DIEPCTL_EPTYP_POS) | 8UL);
+    check_eq("GET_CONFIGURATION returns 1",
+             host_control(0x80, USB_REQ_GET_CONFIGURATION, 0, 0, 1, NULL, in, &got), HOST_ACK);
+    check_eq("  value", in[0], 1);
+    check_eq("not connected until DTR", bsp_usb_cdc_connected(), 0);
+
+    /* CDC class requests on interface 0. */
+    const uint8_t coding[7] = {0x00, 0xC2, 0x01, 0x00, 0, 0, 8}; /* 115200 8N1 */
+    check_eq("SET_LINE_CODING ACKed",
+             host_control(0x21, CDC_REQ_SET_LINE_CODING, 0, 0, 7, coding, NULL, NULL), HOST_ACK);
+    bsp_usb_cdc_line_coding_t lc = bsp_usb_cdc_line_coding();
+    check_eq("  baud seen by the application", lc.baud, 115200);
+    check_eq("  data bits", lc.data_bits, 8);
+    const uint8_t coding2[7] = {0x80, 0x25, 0x00, 0x00, 2, 1, 7}; /* 9600 7O2 */
+    check_eq("SET_LINE_CODING(9600 7O2) ACKed",
+             host_control(0x21, CDC_REQ_SET_LINE_CODING, 0, 0, 7, coding2, NULL, NULL), HOST_ACK);
+    lc = bsp_usb_cdc_line_coding();
+    check_eq("  baud/stop/parity/bits", ((uint64_t)lc.baud << 24) | (lc.stop_bits << 16) | (lc.parity << 8) | lc.data_bits,
+             (9600ULL << 24) | (2U << 16) | (1U << 8) | 7U);
+    check_eq("GET_LINE_CODING ACKed",
+             host_control(0xA1, CDC_REQ_GET_LINE_CODING, 0, 0, 7, NULL, in, &got), HOST_ACK);
+    check_eq("  echoes the 7 bytes", got == 7U && memcmp(in, coding2, 7) == 0, 1);
+
+    check_eq("SET_CONTROL_LINE_STATE(DTR|RTS) ACKed",
+             host_control(0x21, CDC_REQ_SET_CONTROL_LINE_STATE, 0x0003, 0, 0, NULL, NULL, NULL), HOST_ACK);
+    check_eq("  DTR seen", bsp_usb_cdc_dtr(), 1);
+    check_eq("  RTS seen", bsp_usb_cdc_rts(), 1);
+    check_eq("  connected", bsp_usb_cdc_connected(), 1);
+
+    /* Host -> device on EP1 OUT. */
+    const uint8_t hello[] = "hello, blackpill";
+    check_eq("OUT EP1 packet ACKed", host_out(1, hello, sizeof(hello) - 1U), HOST_ACK);
+    check_eq("  bytes available to the application", bsp_usb_cdc_available(), sizeof(hello) - 1U);
+    uint8_t rx[32];
+    check_eq("  read returns them", bsp_usb_cdc_read(rx, sizeof(rx)), sizeof(hello) - 1U);
+    check_eq("  contents", memcmp(rx, hello, sizeof(hello) - 1U), 0);
+    check_eq("  EP1 OUT re-armed", OTG_FS_DEVICE->OUTEP[1].DOEPCTL & OTG_DOEPCTL_EPENA, OTG_DOEPCTL_EPENA);
+    check_eq("  first byte via read_byte after a second packet",
+             (host_out(1, (const uint8_t*)"Z", 1) == HOST_ACK) ? bsp_usb_cdc_read_byte() : 0, 'Z');
+
+    /* Device -> host on EP1 IN: a short message, then a 64-byte multiple
+     * which owes the host a zero-length packet. */
+    const uint8_t msg[] = "pong";
+    check_eq("write of 4 bytes accepted", DRIVE(bsp_usb_cdc_write(msg, 4)), 4);
+    check_eq("IN EP1 delivers them", host_in(1, in, &got), HOST_ACK);
+    check_eq("  4 bytes", got, 4);
+    check_eq("  contents", memcmp(in, msg, 4), 0);
+    check_eq("IN EP1 NAKs when idle", host_in(1, in, &got), HOST_NAK);
+
+    uint8_t big[128];
+    for (unsigned i = 0; i < sizeof(big); i++) { big[i] = (uint8_t)i; }
+    check_eq("write of 128 bytes accepted", DRIVE(bsp_usb_cdc_write(big, sizeof(big))), 128);
+    check_eq("IN EP1 delivers the transfer", host_in(1, in, &got), HOST_ACK);
+    check_eq("  128 bytes in one transfer (2 packets)", got, 128);
+    check_eq("  contents", memcmp(in, big, 128), 0);
+    check_eq("  zero-length packet follows (length % 64 == 0)", host_in(1, in, &got) == HOST_ACK && got == 0U, 1);
+    check_eq("IN EP1 NAKs again", host_in(1, in, &got), HOST_NAK);
+
+    /* Larger than one chunk: the ring drains over successive IN tokens. */
+    static uint8_t huge[700];
+    for (unsigned i = 0; i < sizeof(huge); i++) { huge[i] = (uint8_t)(i * 7U); }
+    const size_t accepted = DRIVE(bsp_usb_cdc_write(huge, sizeof(huge)));
+    check_eq("write of 700 bytes accepted (ring + FIFO)", accepted, 700);
+    unsigned collected = 0;
+    for (int guard = 0; guard < 8 && collected < 700U; guard++)
+    {
+        if (host_in(1, in + collected, &got) != HOST_ACK) { break; }
+        collected += got;
+    }
+    check_eq("  all 700 bytes reach the host", collected, 700);
+    check_eq("  contents", memcmp(in, huge, 700), 0);
+
+    /* DTR dropped: writes are discarded, nothing queued. */
+    check_eq("SET_CONTROL_LINE_STATE(0) ACKed",
+             host_control(0x21, CDC_REQ_SET_CONTROL_LINE_STATE, 0, 0, 0, NULL, NULL, NULL), HOST_ACK);
+    check_eq("  disconnected", bsp_usb_cdc_connected(), 0);
+    check_eq("  write while disconnected is discarded (0 accepted)", DRIVE(bsp_usb_cdc_write(msg, 4)), 0);
+    while (host_in(1, in, &got) == HOST_ACK && got != 0U) { }
+    check_eq("  nothing reaches the host", got, 0);
+
+    check_eq("SET_CONFIGURATION(0) ACKed", host_control(0x00, USB_REQ_SET_CONFIGURATION, 0, 0, 0, NULL, NULL, NULL), HOST_ACK);
+    check_eq("  unconfigured", bsp_usb_configured(), 0);
+    check_eq("  EP1 IN deactivated", OTG_FS_DEVICE->INEP[1].DIEPCTL & OTG_DIEPCTL_USBAEP, 0);
+    check_eq("  EP1 OUT deactivated", OTG_FS_DEVICE->OUTEP[1].DOEPCTL & (OTG_DOEPCTL_USBAEP | OTG_DOEPCTL_EPENA), 0);
+    check_eq("OUT EP1 NAKs when closed", host_out(1, hello, 4), HOST_NAK);
+
+    /* A second bus reset must bring the device back to the default state. */
+    host_reset();
+    check_eq("after re-reset: DAD = 0", FIELD(OTG_FS_DEVICE->DCFG, OTG_DCFG_DAD_MSK, OTG_DCFG_DAD_POS), 0);
+    check_eq("after re-reset: device descriptor still served",
+             host_control(0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_DEVICE << 8, 0, 18, NULL, in, &got), HOST_ACK);
+
+    printf("        (%u interrupt handler runs, %u IN tokens, %u OUT tokens)\n", usb.irqs, usb.in_tokens,
+           usb.out_tokens);
+    group_end();
+}
+
 int main(void)
 {
     for (size_t i = 0; i < REGION_COUNT; i++)
@@ -1235,6 +3133,12 @@ int main(void)
     RCC->CR = 0x00000083UL;
     RCC->CFGR = 0;
     RCC->PLLCFGR = 0x24003010UL;
+    OTG_FS_GLOBAL->GRSTCTL = 0x80000000UL; /* AHBIDL: the AHB master is idle */
+    OTG_FS_GLOBAL->GUSBCFG = 0x00001440UL; /* TRDT=5, TOCAL=0                */
+    OTG_FS_DEVICE->DCTL = 0x00000002UL;    /* SDIS: soft-disconnected        */
+    ((volatile uint32_t*)UID_BASE)[0] = 0x00230041UL; /* a plausible 96-bit unique ID */
+    ((volatile uint32_t*)UID_BASE)[1] = 0x30395110UL;
+    ((volatile uint32_t*)UID_BASE)[2] = 0x20313436UL;
 
     pthread_t th;
     if (pthread_create(&th, NULL, silicon, NULL) != 0)
@@ -1254,6 +3158,8 @@ int main(void)
     test_tim();
     test_dma();
     test_i2c();
+    test_sdio();
+    test_usb();
 
     monitor_disarm();
     atomic_store(&sim_stop, 1);

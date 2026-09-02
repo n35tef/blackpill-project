@@ -5,10 +5,30 @@
 
 #include "bsp_systick.h"
 
-#if BSP_USE_SYSTICK
-
 #include "bsp_clock.h"
 #include "device/stm32f411.h"
+
+void bsp_delay_us(uint32_t us)
+{
+#ifdef BSP_HOST_SIM
+    /* The simulator counts cycles instead of spinning, so drivers that cut a
+     * settling time short are caught by its timing rules. */
+    __busy_wait((BSP_HCLK_HZ / 1000000UL) * us);
+#else
+    /*
+     * Rough loop calibrated on cycles rather than the tick counter, so it
+     * still works for delays shorter than one tick. The loop body is three
+     * instructions on Cortex-M4, hence the divide by three.
+     */
+    volatile uint32_t cycles = (BSP_HCLK_HZ / 3000000UL) * us;
+
+    while (cycles-- != 0U)
+    {
+    }
+#endif
+}
+
+#if BSP_USE_SYSTICK
 
 #define SYSTICK_RELOAD (BSP_HCLK_HZ / BSP_SYSTICK_FREQ_HZ)
 
@@ -48,20 +68,6 @@ void bsp_delay_ms(uint32_t ms)
     while ((s_ticks - start) < target)
     {
         __WFI();
-    }
-}
-
-void bsp_delay_us(uint32_t us)
-{
-    /*
-     * Rough loop calibrated on cycles rather than the tick counter, so it
-     * still works for delays shorter than one tick. The loop body is three
-     * instructions on Cortex-M4, hence the divide by three.
-     */
-    volatile uint32_t cycles = (BSP_HCLK_HZ / 3000000UL) * us;
-
-    while (cycles-- != 0U)
-    {
     }
 }
 

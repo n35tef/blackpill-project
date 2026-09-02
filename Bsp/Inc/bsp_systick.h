@@ -27,9 +27,6 @@ uint32_t bsp_tick(void);
 /** @brief Busy-wait for at least @p ms milliseconds. */
 void bsp_delay_ms(uint32_t ms);
 
-/** @brief Busy-wait for approximately @p us microseconds (cycle counted). */
-void bsp_delay_us(uint32_t us);
-
 /**
  * @brief Called from the SysTick interrupt after the tick counter advances.
  *
@@ -38,6 +35,14 @@ void bsp_delay_us(uint32_t us);
 void bsp_systick_callback(void);
 
 #endif /* BSP_USE_SYSTICK */
+
+/**
+ * @brief Busy-wait for approximately @p us microseconds (cycle counted).
+ *
+ * Does not need SysTick, so it is always available; the SDIO and USB drivers
+ * fall back to it for their bring-up delays when the tick is disabled.
+ */
+void bsp_delay_us(uint32_t us);
 
 #ifdef __cplusplus
 }

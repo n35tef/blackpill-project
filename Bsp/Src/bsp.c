@@ -56,6 +56,14 @@ bsp_status_t bsp_init(void)
     bsp_crc_init();
 #endif
 
+#if BSP_USE_SDIO
+    bsp_sdio_init(); /* peripheral only; call bsp_sd_init() when a card is inserted */
+#endif
+
+#if BSP_USE_USB_CDC
+    bsp_usb_cdc_init();
+#endif
+
 #if BSP_USE_RTC
     if (bsp_rtc_init() != 0)
     {

@@ -289,3 +289,83 @@ CHECK_OFFSET(dma_regs_t, HIFCR, 0x0C);
 CHECK_OFFSET(dma_regs_t, STREAM, 0x10);
 CHECK_SIZE(dma_regs_t, 0xD0);
 _Static_assert(sizeof(dma_stream_regs_t) == 0x18, "DMA stream stride");
+
+/* ---- SDIO --------------------------------------------------------------- */
+CHECK_OFFSET(sdio_regs_t, POWER, 0x00);
+CHECK_OFFSET(sdio_regs_t, CLKCR, 0x04);
+CHECK_OFFSET(sdio_regs_t, ARG, 0x08);
+CHECK_OFFSET(sdio_regs_t, CMD, 0x0C);
+CHECK_OFFSET(sdio_regs_t, RESPCMD, 0x10);
+CHECK_OFFSET(sdio_regs_t, RESP1, 0x14);
+CHECK_OFFSET(sdio_regs_t, RESP4, 0x20);
+CHECK_OFFSET(sdio_regs_t, DTIMER, 0x24);
+CHECK_OFFSET(sdio_regs_t, DLEN, 0x28);
+CHECK_OFFSET(sdio_regs_t, DCTRL, 0x2C);
+CHECK_OFFSET(sdio_regs_t, DCOUNT, 0x30);
+CHECK_OFFSET(sdio_regs_t, STA, 0x34);
+CHECK_OFFSET(sdio_regs_t, ICR, 0x38);
+CHECK_OFFSET(sdio_regs_t, MASK, 0x3C);
+CHECK_OFFSET(sdio_regs_t, FIFOCNT, 0x48);
+CHECK_OFFSET(sdio_regs_t, FIFO, 0x80);
+CHECK_SIZE(sdio_regs_t, 0x84);
+_Static_assert(SDIO_BASE == 0x40012C00UL, "SDIO base address");
+
+/* ---- USB OTG FS --------------------------------------------------------- */
+CHECK_OFFSET(otg_fs_global_regs_t, GOTGCTL, 0x000);
+CHECK_OFFSET(otg_fs_global_regs_t, GAHBCFG, 0x008);
+CHECK_OFFSET(otg_fs_global_regs_t, GUSBCFG, 0x00C);
+CHECK_OFFSET(otg_fs_global_regs_t, GRSTCTL, 0x010);
+CHECK_OFFSET(otg_fs_global_regs_t, GINTSTS, 0x014);
+CHECK_OFFSET(otg_fs_global_regs_t, GINTMSK, 0x018);
+CHECK_OFFSET(otg_fs_global_regs_t, GRXSTSR, 0x01C);
+CHECK_OFFSET(otg_fs_global_regs_t, GRXSTSP, 0x020);
+CHECK_OFFSET(otg_fs_global_regs_t, GRXFSIZ, 0x024);
+CHECK_OFFSET(otg_fs_global_regs_t, DIEPTXF0, 0x028);
+CHECK_OFFSET(otg_fs_global_regs_t, HNPTXSTS, 0x02C);
+CHECK_OFFSET(otg_fs_global_regs_t, GCCFG, 0x038);
+CHECK_OFFSET(otg_fs_global_regs_t, CID, 0x03C);
+CHECK_OFFSET(otg_fs_global_regs_t, HPTXFSIZ, 0x100);
+CHECK_OFFSET(otg_fs_global_regs_t, DIEPTXF1, 0x104);
+CHECK_OFFSET(otg_fs_global_regs_t, DIEPTXF3, 0x10C);
+CHECK_SIZE(otg_fs_global_regs_t, 0x110);
+
+CHECK_OFFSET(otg_fs_host_regs_t, HCFG, 0x000);
+CHECK_OFFSET(otg_fs_host_regs_t, HFIR, 0x004);
+CHECK_OFFSET(otg_fs_host_regs_t, HFNUM, 0x008);
+CHECK_OFFSET(otg_fs_host_regs_t, HPTXSTS, 0x010);
+CHECK_OFFSET(otg_fs_host_regs_t, HAINT, 0x014);
+CHECK_OFFSET(otg_fs_host_regs_t, HAINTMSK, 0x018);
+CHECK_OFFSET(otg_fs_host_regs_t, HPRT, 0x040);
+CHECK_OFFSET(otg_fs_host_regs_t, HC, 0x100);
+_Static_assert(sizeof(otg_fs_hc_regs_t) == 0x20, "OTG host channel stride");
+CHECK_OFFSET(otg_fs_hc_regs_t, HCINT, 0x08);
+CHECK_OFFSET(otg_fs_hc_regs_t, HCINTMSK, 0x0C);
+CHECK_OFFSET(otg_fs_hc_regs_t, HCTSIZ, 0x10);
+
+CHECK_OFFSET(otg_fs_device_regs_t, DCFG, 0x000);
+CHECK_OFFSET(otg_fs_device_regs_t, DCTL, 0x004);
+CHECK_OFFSET(otg_fs_device_regs_t, DSTS, 0x008);
+CHECK_OFFSET(otg_fs_device_regs_t, DIEPMSK, 0x010);
+CHECK_OFFSET(otg_fs_device_regs_t, DOEPMSK, 0x014);
+CHECK_OFFSET(otg_fs_device_regs_t, DAINT, 0x018);
+CHECK_OFFSET(otg_fs_device_regs_t, DAINTMSK, 0x01C);
+CHECK_OFFSET(otg_fs_device_regs_t, DVBUSDIS, 0x028);
+CHECK_OFFSET(otg_fs_device_regs_t, DVBUSPULSE, 0x02C);
+CHECK_OFFSET(otg_fs_device_regs_t, DIEPEMPMSK, 0x034);
+CHECK_OFFSET(otg_fs_device_regs_t, INEP, 0x100);  /* 0x900 absolute */
+CHECK_OFFSET(otg_fs_device_regs_t, OUTEP, 0x300); /* 0xB00 absolute */
+CHECK_SIZE(otg_fs_device_regs_t, 0x380);
+_Static_assert(sizeof(otg_fs_inep_regs_t) == 0x20, "OTG IN endpoint stride");
+_Static_assert(sizeof(otg_fs_outep_regs_t) == 0x20, "OTG OUT endpoint stride");
+CHECK_OFFSET(otg_fs_inep_regs_t, DIEPINT, 0x08);
+CHECK_OFFSET(otg_fs_inep_regs_t, DIEPTSIZ, 0x10);
+CHECK_OFFSET(otg_fs_inep_regs_t, DTXFSTS, 0x18);
+CHECK_OFFSET(otg_fs_outep_regs_t, DOEPINT, 0x08);
+CHECK_OFFSET(otg_fs_outep_regs_t, DOEPTSIZ, 0x10);
+
+_Static_assert(OTG_FS_GLOBAL_BASE == 0x50000000UL, "OTG_FS global base address");
+_Static_assert(OTG_FS_HOST_BASE == 0x50000400UL, "OTG_FS host base address");
+_Static_assert(OTG_FS_DEVICE_BASE == 0x50000800UL, "OTG_FS device base address");
+_Static_assert(OTG_FS_PWRCLK_BASE == 0x50000E00UL, "OTG_FS power/clock base address");
+_Static_assert(OTG_FS_FIFO_BASE == 0x50001000UL, "OTG_FS EP0 FIFO address");
+_Static_assert(OTG_FS_FIFO_BASE + 3UL * OTG_FS_FIFO_STRIDE == 0x50004000UL, "OTG_FS EP3 FIFO address");

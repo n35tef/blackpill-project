@@ -117,6 +117,8 @@ right order, and the modules you left off are not compiled.
 | `BSP_USE_RTC` | `bsp_misc` | calendar on LSE or LSI |
 | `BSP_USE_IWDG` / `BSP_USE_WWDG` | `bsp_misc` | watchdogs |
 | `BSP_USE_CRC` | `bsp_misc` | hardware CRC-32 |
+| `BSP_USE_SDIO` | `bsp_sdio` | SD card: `bsp_sd_init()`, `bsp_sd_read_blocks()`, `bsp_sd_write_blocks()` |
+| `BSP_USE_USB_CDC` | `bsp_usb`, `bsp_usb_cdc` | virtual COM port over the USB-C connector, `printf` retargeting |
 
 ### Pins
 
@@ -144,6 +146,10 @@ full-package tables suggest. Watch out for the traps this package creates:
 - **The temperature sensor is on ADC channel 18**, shared with VBAT, not on
   channel 16 as it is on the F405/F407.
 - **USART6 and SPI4/SPI5 collide with USB**, all of them wanting PA11/PA12.
+- **SDIO has no conflict-free home on 48 pins.** The defaults (CK PB15, CMD
+  PA6, D0 PB4, D1 PA8, D2 PA9, D3 PB5) take pins from SPI2 (PB15), SPI1 (PA6),
+  SPI3/I2C3 (PB4/PB5) and USART1 (PA9). D0 can move to PB7 and the bus can
+  drop to 1 bit (`BSP_SDIO_BUS_WIDTH 1`) to free PA8/PA9/PB5.
 
 ## Printing
 
@@ -157,6 +163,45 @@ Enable a USART, point stdout at it, and `printf` works:
 The newlib stubs in `Bsp/Src/bsp_syscalls.c` route output there; `\n` is
 expanded to `\r\n`. With `BSP_STDOUT_USART 0` the stubs swallow output and cost
 nothing.
+
+Or skip the adapter and print over the board's own USB-C connector:
+
+```c
+#define BSP_USE_USB_CDC  1
+#define BSP_STDOUT_USB   1
+```
+
+The device shows up as `/dev/ttyACM0` (Linux), a COM port (Windows) or
+`/dev/tty.usbmodem*` (macOS) with no driver. Output is discarded until a
+terminal opens the port and asserts DTR, so a board that is not plugged into a
+computer does not stall on `printf`. The default VID/PID are the
+[pid.codes](https://pid.codes) test IDs (`0x1209:0x0001`), fine on a bench
+and not for anything you ship. The serial number is derived from the chip's
+96-bit unique ID, so two boards never collide.
+
+## SD card
+
+```c
+#define BSP_USE_SDIO 1
+```
+
+`bsp_init()` sets up the controller and pins; the card itself is brought up
+when you ask, since it may not be there yet:
+
+```c
+if (bsp_sd_init() == BSP_SD_OK)
+{
+    const bsp_sd_card_t* card = bsp_sd_card();   /* block_count, SDHC?, CID, CSD */
+    uint8_t sector[512];
+    bsp_sd_read_blocks(0, sector, 1);
+    bsp_sd_write_blocks(1000, sector, 1);
+}
+```
+
+Transfers are polled, 512-byte blocks, 4-bit bus at 24 MHz by default (both
+configurable). SDSC, SDHC and SDXC cards are handled; MMC is refused with
+`BSP_SD_EUNSUPPORTED`. The layer stops at blocks - drop a FAT library on top if
+you want files.
 
 ## Example
 
@@ -223,16 +268,19 @@ it and the drivers against the outside world, neither of which needs a board:
 - **`tools/svdcheck`** compares every base address, register offset and bit
   field against ST's published CMSIS-SVD description of the STM32F411 - an
   independent statement of the same facts, generated from the same database as
-  ST's own headers. 38 base addresses, 177 registers and 375 bit fields
+  ST's own headers. 43 base addresses, 241 registers and 757 bit fields
   currently agree.
 - **`tools/hostsim`** maps the peripheral region into a host process at its
   real addresses and runs the unmodified drivers against it, with a thread
   playing the part of the silicon. Every register access is trapped and checked
   against RM0383 sequencing rules (clock gating, flash latency before a clock
   switch, no reconfiguring an enabled SPI/DMA, ADC settling time, the I2C
-  ADDR-clearing read sequence). 127 checks confirm both the bits the drivers
-  write and the order they write them in, with expected values recomputed from
-  RM0383 rather than from the driver's own macros.
+  ADDR-clearing read sequence, the SD bring-up and data-path ordering, the
+  OTG_FS core/device init and endpoint sequences). 254 checks confirm both the
+  bits the drivers write and the order they write them in, with expected values
+  recomputed from RM0383 rather than from the driver's own macros. The SD driver
+  runs against a fake card and the USB device enumerates against a fake host,
+  interrupt handler included.
 
 Both tools, what they cover, and - importantly - what they cannot tell you are
 documented in [tools/README.md](tools/README.md). The short version:

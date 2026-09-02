@@ -127,6 +127,11 @@
 #define BSP_USE_CRC         0
 #define BSP_USE_EXTI        0
 
+/* ---- USB and SD card ---------------------------------------------------- */
+/* Both run from the 48 MHz PLL Q output, so they need a PLL clock source.   */
+#define BSP_USE_USB_CDC     0 /**< virtual COM port on the USB-C connector   */
+#define BSP_USE_SDIO        0 /**< SD card over the SDIO peripheral          */
+
 /* ========================================================================= */
 /* Per-peripheral settings                                                   */
 /* ========================================================================= */
@@ -333,5 +338,51 @@
 
 /* ---- RTC ---------------------------------------------------------------- */
 #define BSP_RTC_CLOCK_LSE 1 /**< 1 = LSE (needs BSP_USE_LSE), 0 = LSI */
+
+/* ---- USB CDC-ACM (virtual COM port) ------------------------------------- */
+/* D- PA11 and D+ PA12 are fixed (AF10) and shared with USART6 and with       */
+/* SPI4 MISO / SPI5 MISO. The BlackPill has no VBUS divider, so VBUS sensing  */
+/* is off and PA9 stays free. The core needs PLLQ = 48 MHz exactly.          */
+#define BSP_USB_VID            0x1209U /**< pid.codes test VID: not for products */
+#define BSP_USB_PID            0x0001U /**< pid.codes test PID                   */
+#define BSP_USB_DEVICE_VERSION 0x0100U /**< bcdDevice 1.00                       */
+#define BSP_USB_MANUFACTURER   "BlackPill BSP"
+#define BSP_USB_PRODUCT        "STM32F411 Virtual COM Port"
+#define BSP_USB_SERIAL_FROM_UID 1      /**< 1 = 24 hex digits from the chip's unique ID */
+#define BSP_USB_SERIAL         "0001"  /**< used when SERIAL_FROM_UID is 0        */
+#define BSP_USB_SELF_POWERED   0       /**< 0 = bus powered (BlackPill on USB)    */
+#define BSP_USB_MAX_POWER_MA   100U    /**< reported to the host, 2..500          */
+#define BSP_USB_CDC_RX_BUFFER  512U    /**< power of two, >= 128                  */
+#define BSP_USB_CDC_TX_BUFFER  512U    /**< power of two, >= 64                   */
+#define BSP_USB_CDC_TX_TIMEOUT_MS 50UL /**< give up on a host that stops reading  */
+#define BSP_USB_IRQ_PRIORITY   8U      /**< OTG_FS interrupt, 0 = highest         */
+#define BSP_USB_SOF_IRQ        0       /**< 1 = take an interrupt every 1 ms frame */
+
+/** Send printf()/stdout to the virtual COM port (excludes BSP_STDOUT_USART). */
+#define BSP_STDOUT_USB 0
+
+/* ---- SDIO / SD card ----------------------------------------------------- */
+/* AF12 options on this package: CK PB15 | CMD PA6 | D0 PB4 or PB7 | D1 PA8   */
+/* D2 PA9 | D3 PB5 (D4 PB8, D5 PB9, D6 PB14, D7 PB10 exist but 8-bit SD is    */
+/* not implemented). The defaults collide with SPI1 MISO (PA6), SPI2 MOSI    */
+/* (PB15), SPI3 MISO/MOSI (PB4/PB5), USART1 TX (PA9) and I2C3 SDA (PB4).      */
+/* 1-bit mode frees PA8, PA9 and PB5. CLK_HZ is the bus clock after the card  */
+/* is identified: SDIO_CK = 48 MHz / (n + 2), n = 0..255, and it must not     */
+/* exceed HCLK / 2 or 25 MHz (default-speed cards); 24 MHz is the practical   */
+/* maximum. The card is always identified at 400 kHz first.                  */
+#define BSP_SDIO_BUS_WIDTH 4U        /**< 1 or 4 data lines              */
+#define BSP_SDIO_CLK_HZ    24000000UL /**< data transfer clock            */
+#define BSP_SDIO_CK_PORT   GPIOB
+#define BSP_SDIO_CK_PIN    15U
+#define BSP_SDIO_CMD_PORT  GPIOA
+#define BSP_SDIO_CMD_PIN   6U
+#define BSP_SDIO_D0_PORT   GPIOB
+#define BSP_SDIO_D0_PIN    4U
+#define BSP_SDIO_D1_PORT   GPIOA
+#define BSP_SDIO_D1_PIN    8U
+#define BSP_SDIO_D2_PORT   GPIOA
+#define BSP_SDIO_D2_PIN    9U
+#define BSP_SDIO_D3_PORT   GPIOB
+#define BSP_SDIO_D3_PIN    5U
 
 #endif /* BSP_CONFIG_H */

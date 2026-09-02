@@ -28,6 +28,10 @@ INSTANCE_ALIAS = {
     "ADC_COMMON": "ADC_Common",
 }
 
+# Instances we define that the SVD has no peripheral for. OTG_FS_BASE is the
+# start of the whole core; the SVD only names the blocks inside it.
+INSTANCE_IGNORE = {"OTG_FS"}
+
 # Macro prefix -> SVD peripherals the macro is allowed to describe. A field is
 # accepted if it matches any candidate, because e.g. TIM_ macros are shared by
 # timers whose register sets are supersets of each other.
@@ -41,8 +45,13 @@ PREFIX_CANDIDATES = {
     "ADC": ["ADC1", "ADC_Common"],
     "RCC": ["RCC"], "PWR": ["PWR"], "FLASH": ["FLASH"], "EXTI": ["EXTI"],
     "SYSCFG": ["SYSCFG"], "CRC": ["CRC"], "IWDG": ["IWDG"], "WWDG": ["WWDG"],
-    "RTC": ["RTC"],
+    "RTC": ["RTC"], "SDIO": ["SDIO"],
+    "OTG": ["OTG_FS_GLOBAL", "OTG_FS_DEVICE", "OTG_FS_HOST", "OTG_FS_PWRCLK"],
 }
+
+# The SVD prefixes most OTG_FS register names with "FS_" but not all of them,
+# so a register that is not found under its own name is retried with this.
+FALLBACK_REG_PREFIX = "FS_"
 
 # Struct member -> SVD register name, when our layout groups things the SVD
 # spells out. The SVD lists DMA stream registers as S0CR, S0NDTR, ...; we model
@@ -50,7 +59,27 @@ PREFIX_CANDIDATES = {
 # stream struct starts at 0x10 inside the DMA block, which the SVD offsets
 # already include, hence the extra bias.
 STRUCT_REG_PREFIX = {"dma_stream_regs_t": "S0"}
-STRUCT_OFFSET_BIAS = {"dma_stream_regs_t": 0x10}
+STRUCT_OFFSET_BIAS = {
+    "dma_stream_regs_t": 0x10,
+    # OTG endpoint and host-channel blocks are indexed arrays inside their
+    # parent block; the SVD spells out instance 0 of each at these offsets.
+    "otg_fs_inep_regs_t": 0x100,
+    "otg_fs_outep_regs_t": 0x300,
+    "otg_fs_hc_regs_t": 0x100,
+}
+STRUCT_REG_SUFFIX = {
+    "otg_fs_inep_regs_t": "0",
+    "otg_fs_outep_regs_t": "0",
+    "otg_fs_hc_regs_t": "0",
+}
+# Struct types with no instance macro of their own: which SVD peripheral to
+# read them against.
+STRUCT_PERIPH = {
+    "dma_stream_regs_t": "DMA1",
+    "otg_fs_inep_regs_t": "OTG_FS_DEVICE",
+    "otg_fs_outep_regs_t": "OTG_FS_DEVICE",
+    "otg_fs_hc_regs_t": "OTG_FS_HOST",
+}
 
 # Members we model as an array where the SVD enumerates one register each.
 ARRAY_MEMBERS = {
@@ -67,6 +96,10 @@ STRUCT_REG_ALIAS = {
     ("tim_regs_t", "CCMR1"): "CCMR1_Output",
     ("tim_regs_t", "CCMR2"): "CCMR2_Output",
     ("tim_regs_t", "OR"): None,   # only on TIM2/5/11, absent from the TIM1 view
+    # The SVD gives the mode-dependent OTG registers a host and a device view.
+    ("otg_fs_global_regs_t", "GRXSTSR"): "FS_GRXSTSR_Device",
+    ("otg_fs_global_regs_t", "DIEPTXF0"): "FS_GNPTXFSIZ_Device",
+    ("otg_fs_global_regs_t", "HNPTXSTS"): "FS_GNPTXSTS",
 }
 
 # Registers this SVD revision simply does not describe for the F411. They are
@@ -78,6 +111,9 @@ SVD_MISSING = {
     ("adc_common_regs_t", "CDR"),
     ("rcc_regs_t", "DCKCFGR"),
     ("i2c_regs_t", "FLTR"),
+    # The read-and-pop twin of GRXSTSR (RM0383 22.15.12); the SVD only lists
+    # the debug-read one.
+    ("otg_fs_global_regs_t", "GRXSTSP"),
 }
 
 # Macro register token -> SVD register name.
@@ -91,6 +127,28 @@ MACRO_REG_ALIAS = {
     ("DMA", "CR"): ["S0CR"], ("DMA", "NDTR"): ["S0NDTR"],
     ("DMA", "PAR"): ["S0PAR"], ("DMA", "M0AR"): ["S0M0AR"],
     ("DMA", "M1AR"): ["S0M1AR"], ("DMA", "FCR"): ["S0FCR"],
+    # OTG endpoint registers: EP1..3 carry the full-width fields, EP0 the
+    # narrow ones, so both are candidates and the EP0-only macros (DIEPCTL0_,
+    # DIEPTSIZ0_ ...) map to instance 0 alone.
+    ("OTG", "DIEPCTL"): ["DIEPCTL1", "DIEPCTL2", "FS_DIEPCTL0"],
+    ("OTG", "DIEPCTL0"): ["FS_DIEPCTL0"],
+    ("OTG", "DOEPCTL"): ["DOEPCTL1", "DOEPCTL0"],
+    ("OTG", "DOEPCTL0"): ["DOEPCTL0"],
+    ("OTG", "DIEPINT"): ["DIEPINT0"],
+    ("OTG", "DOEPINT"): ["DOEPINT0"],
+    ("OTG", "DIEPTSIZ"): ["DIEPTSIZ1"],
+    ("OTG", "DIEPTSIZ0"): ["DIEPTSIZ0"],
+    ("OTG", "DOEPTSIZ"): ["DOEPTSIZ1"],
+    ("OTG", "DOEPTSIZ0"): ["DOEPTSIZ0"],
+    ("OTG", "DTXFSTS"): ["DTXFSTS0"],
+    ("OTG", "DIEPTXF"): ["FS_DIEPTXF1"],
+    ("OTG", "DIEPTXF0"): ["FS_GNPTXFSIZ_Device"],
+    ("OTG", "GRXSTSP"): ["FS_GRXSTSR_Device"],
+    ("OTG", "HNPTXSTS"): ["FS_GNPTXSTS"],
+    ("OTG", "HCCHAR"): ["FS_HCCHAR0"],
+    ("OTG", "HCINT"): ["FS_HCINT0"],
+    ("OTG", "HCINTMSK"): ["FS_HCINTMSK0"],
+    ("OTG", "HCTSIZ"): ["FS_HCTSIZ0"],
 }
 
 # Field renames, keyed by (macro prefix, register, our field name).
@@ -109,6 +167,7 @@ FIELD_SVD_MISSING = {
     ("RCC", "BDCR", "LSEMOD"),
     ("PWR", "CR", "LPLVDS"),
     ("PWR", "CR", "MRLVDS"),
+    ("OTG", "GCCFG", "NOVBUSSENS"),  # RM0383 22.15.9 bit 21; SVD stops at bit 20
 }
 
 
@@ -205,6 +264,8 @@ def check(bsp, svd):
 
     # ---- base addresses -------------------------------------------------
     for iname, inst in sorted(bsp["instances"].items()):
+        if iname in INSTANCE_IGNORE:
+            continue
         sname = INSTANCE_ALIAS.get(iname, iname)
         if sname not in svd:
             stats["base_unmapped"] += 1
@@ -223,7 +284,8 @@ def check(bsp, svd):
         sname = INSTANCE_ALIAS.get(iname, iname)
         if sname in svd:
             type_to_periph.setdefault(inst["type"], sname)
-    type_to_periph.setdefault("dma_stream_regs_t", "DMA1")
+    for tname, periph in STRUCT_PERIPH.items():
+        type_to_periph.setdefault(tname, periph)
 
     for tname, tinfo in sorted(bsp["structs"].items()):
         periph = type_to_periph.get(tname)
@@ -232,6 +294,7 @@ def check(bsp, svd):
             continue
         regs = svd[periph]["regs"]
         rprefix = STRUCT_REG_PREFIX.get(tname, "")
+        rsuffix = STRUCT_REG_SUFFIX.get(tname, "")
         bias = STRUCT_OFFSET_BIAS.get(tname, 0)
         for mname, mem in tinfo["members"].items():
             ours = mem["offset"] + bias
@@ -263,8 +326,11 @@ def check(bsp, svd):
             if alias is None:
                 stats["reg_unmapped"] += 1
                 continue
-            svd_name = rprefix + alias
+            svd_name = rprefix + alias + rsuffix
             cand = regs.get(svd_name)
+            if cand is None and (FALLBACK_REG_PREFIX + svd_name) in regs:
+                svd_name = FALLBACK_REG_PREFIX + svd_name
+                cand = regs[svd_name]
             if cand is None:
                 stats["reg_unmapped"] += 1
                 problems.append(
@@ -289,7 +355,7 @@ def check(bsp, svd):
         if not cands:
             stats["macro_skipped"] += 1
             continue
-        reg_names = MACRO_REG_ALIAS.get((prefix, reg), [reg])
+        reg_names = MACRO_REG_ALIAS.get((prefix, reg), [reg, FALLBACK_REG_PREFIX + reg])
         if (prefix, reg, field) in FIELD_SVD_MISSING:
             stats["macro_svd_missing"] += 1
             manual.append(f"{mname} = 0x{value:X}")
