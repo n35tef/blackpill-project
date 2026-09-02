@@ -58,18 +58,27 @@
 #error "BSP_ADC1_SAMPLE_TIME must be 3, 15, 28, 56, 84, 112, 144 or 480"
 #endif
 
-/** @brief Write the configured sample time into SMPR1/SMPR2 for a channel. */
+/**
+ * @brief Write the sample time for a channel into SMPR1/SMPR2.
+ *
+ * The internal reference and temperature sensor are high impedance and need
+ * at least 10 us of sampling, so they always get the longest setting rather
+ * than the configured one - at the default 24 MHz ADC clock, 480 cycles is
+ * 20 us while the default 3 cycles would be 0.125 us and read nonsense.
+ */
 static void set_sample_time(uint32_t channel)
 {
+    const uint32_t smp = (channel >= ADC_CHANNEL_VREFINT) ? ADC_SMP_480CYCLES : ADC_SAMPLE_BITS;
+
     if (channel <= 9U)
     {
         const uint32_t shift = channel * 3U;
-        ADC1->SMPR2 = (ADC1->SMPR2 & ~(0x7UL << shift)) | (ADC_SAMPLE_BITS << shift);
+        ADC1->SMPR2 = (ADC1->SMPR2 & ~(0x7UL << shift)) | (smp << shift);
     }
     else
     {
         const uint32_t shift = (channel - 10U) * 3U;
-        ADC1->SMPR1 = (ADC1->SMPR1 & ~(0x7UL << shift)) | (ADC_SAMPLE_BITS << shift);
+        ADC1->SMPR1 = (ADC1->SMPR1 & ~(0x7UL << shift)) | (smp << shift);
     }
 }
 

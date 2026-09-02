@@ -73,6 +73,11 @@ void bsp_iwdg_init(void)
         reload -= 1U;
     }
 
+    /* Starting the watchdog is what forces the LSI on, so it has to come
+     * first: writing PR/RLR and polling PVU/RVU with no LSI running would
+     * never complete. */
+    IWDG->KR = IWDG_KEY_ENABLE;
+
     IWDG->KR = IWDG_KEY_WRITE;
     IWDG->PR = prescaler_code;
     IWDG->RLR = reload;
@@ -82,7 +87,6 @@ void bsp_iwdg_init(void)
     }
 
     IWDG->KR = IWDG_KEY_RELOAD;
-    IWDG->KR = IWDG_KEY_ENABLE;
 }
 
 void bsp_iwdg_refresh(void)

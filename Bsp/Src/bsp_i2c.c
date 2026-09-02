@@ -311,14 +311,16 @@ static int i2c_read_impl(i2c_regs_t* i2c, uint8_t address, uint8_t* data, size_t
     }
     i2c->CR1 &= ~I2C_CR1_ACK;
     data[index++] = (uint8_t)i2c->DR;
-    i2c->CR1 |= I2C_CR1_STOP;
-    data[index++] = (uint8_t)i2c->DR;
 
-    status = wait_sr1(i2c, I2C_SR1_RXNE);
+    /* Wait for the second BTF before stopping. Setting STOP while N is still
+     * being clocked in would cut the last byte short. */
+    status = wait_sr1(i2c, I2C_SR1_BTF);
     if (status != BSP_I2C_OK)
     {
         return status;
     }
+    i2c->CR1 |= I2C_CR1_STOP;
+    data[index++] = (uint8_t)i2c->DR;
     data[index] = (uint8_t)i2c->DR;
     return BSP_I2C_OK;
 }
@@ -353,6 +355,13 @@ int bsp_i2c_write_read(i2c_regs_t* i2c, uint8_t address, const uint8_t* reg_byte
     if (status != BSP_I2C_OK)
     {
         return status;
+    }
+
+    if (length == 0U)
+    {
+        /* Nothing to read, so release the bus instead of holding it. */
+        i2c->CR1 |= I2C_CR1_STOP;
+        return BSP_I2C_OK;
     }
 
     /* Repeated START keeps the bus, so no other master can interleave and the

@@ -157,6 +157,10 @@ uint16_t bsp_spi_transfer(spi_regs_t* spi, uint16_t value)
 
     if (is_transmit_only(spi))
     {
+        /* No receive side to wait on, so block until the frame has actually
+         * been shifted out; otherwise the caller could drop chip select mid
+         * transfer. */
+        bsp_spi_wait_idle(spi);
         return 0U;
     }
 
@@ -201,6 +205,12 @@ void bsp_spi_write_bytes(spi_regs_t* spi, const uint8_t* data, size_t length)
 
 void bsp_spi_wait_idle(spi_regs_t* spi)
 {
+    /* BSY only rises a couple of APB cycles after DR is written, so checking
+     * it alone can pass before the frame has even started. Waiting for TXE
+     * first guarantees the write has been taken up by the shift register. */
+    while ((spi->SR & SPI_SR_TXE) == 0U)
+    {
+    }
     while ((spi->SR & SPI_SR_BSY) != 0U)
     {
     }
